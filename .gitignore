@@ -1,0 +1,9 @@
+# 忽略编译生成的文件夹和文件
+project/build_*/
+project/pc_*/
+project/.sconsign.dblite
+project/__pycache__/
+
+# 忽略 VS Code 本地配置（可选，如果你不想共享本地路径）
+.vscode/
+*.code-workspace
