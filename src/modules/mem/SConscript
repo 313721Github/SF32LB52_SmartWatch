@@ -1,0 +1,10 @@
+import os
+from building import *
+
+cwd = GetCurrentDir()
+src = Glob('*.c')       # 扫描当前文件夹下所有的 .c 文件
+inc = [cwd]             # 把当前文件夹加入头文件搜索路径
+
+# 向上一级汇报自己的工作成果
+group = DefineGroup('app_submodule', src, depend = [''], CPPPATH = inc)
+Return('group')

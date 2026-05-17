@@ -1,30 +1,28 @@
 from building import *
-import rtconfig
 import os
 
+cwd = GetCurrentDir()
 src = []
-inc = []
-cwd = GetCurrentDir() # get current dir path
+inc = [
+    cwd,
+    os.path.join(cwd, 'main'),
+    os.path.join(cwd, 'modules', 'mem')  # <--- 救命稻草：让 LVGL 能顺藤摸瓜找到 app_mem.h
+]
 
-src+=Glob('*.c')
-inc+= [cwd]
+# 核心魔法：在这里登记你需要编译的子文件夹！
+# 如果你以后加了新文件夹，就在这里补一行
+src.extend(SConscript(os.path.join(cwd, 'main/SConscript'), variant_dir="main", duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'modules/SConscript'), variant_dir="modules", duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'gui/SConscript'), variant_dir="gui", duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'modules/mem/SConscript'), variant_dir="modules_mem", duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'hal_port/SConscript'), variant_dir="hal_port", duplicate=0))
+# src.extend(SConscript(os.path.join(cwd, 'gui/SConscript'), variant_dir="gui", duplicate=0)) # 等你建了 gui 文件夹再取消注释
 
-
-#Add resources.
-# Ensure directory is created before any builder is executed
-# If the path is not present, it would not be added in "include path" and 'lang_pack.h' dependency would not work
-Execute(Mkdir('resource/strings'))
-src.extend(SConscript(os.path.join(cwd, 'resource/images/SConscript'), variant_dir="resource/images", duplicate=0))
-src.extend(SConscript(os.path.join(cwd, 'resource/fonts/SConscript'), variant_dir="resource/fonts", duplicate=0))
-src.extend(SConscript(os.path.join(cwd, 'resource/strings/SConscript'), variant_dir="resource/strings", duplicate=0))
-
-#Add GUI applications
-app_objs = SConscript(os.path.join(cwd, 'gui_apps/SConscript'), variant_dir="gui_apps", duplicate=0)
-
-src.extend(app_objs)
-
-# #Add applications utils
-src.extend(SConscript(os.path.join(cwd, 'app_utils/SConscript'), variant_dir="app_utils", duplicate=0))
+# 2. 修复 lang_pack.h：加载多语言和字体资源
+Execute(Mkdir('gui/resource/strings')) # 确保目录存在
+Execute(Mkdir('gui/resource/fonts')) # 确保目录存在
+src.extend(SConscript(os.path.join(cwd, 'gui/resource/strings/SConscript'), variant_dir="resource_strings", duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'gui/resource/fonts/SConscript'), variant_dir="resource_fonts", duplicate=0))
 
 group = DefineGroup('app', src, depend = ['PKG_USING_LITTLEVGL2RTT'], CPPPATH = inc)
 Return('group')
