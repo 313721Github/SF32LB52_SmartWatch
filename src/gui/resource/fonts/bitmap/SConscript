@@ -10,7 +10,8 @@ inc = []
 group=[]
 
 
-src += Glob('*.c')
+# Exclude montserrat fonts already provided by the SDK LVGL
+src += [f for f in Glob('*.c') if 'montserrat' not in str(f)]
 
 LOCAL_CCFLAGS = ''
 

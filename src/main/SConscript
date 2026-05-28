@@ -14,6 +14,6 @@ if GetDepend('BSP_BT_APP'):
 
 CPPPATH = [cwd]
 
-group = DefineGroup('App_utils', src, depend = [''], CPPPATH = CPPPATH)
+group = DefineGroup('main', src, depend = [''], CPPPATH = CPPPATH)
 
 Return('group')

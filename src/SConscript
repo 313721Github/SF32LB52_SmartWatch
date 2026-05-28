@@ -6,7 +6,11 @@ src = []
 inc = [
     cwd,
     os.path.join(cwd, 'main'),
-    os.path.join(cwd, 'modules', 'mem')  # <--- 救命稻草：让 LVGL 能顺藤摸瓜找到 app_mem.h
+    os.path.join(cwd, 'hal_port'),
+    os.path.join(cwd, 'modules'),
+    os.path.join(cwd, 'modules', 'mem'),
+    os.path.join(cwd, 'gui'),
+    os.path.join(cwd, 'apps'),
 ]
 
 # 核心魔法：在这里登记你需要编译的子文件夹！
@@ -16,13 +20,14 @@ src.extend(SConscript(os.path.join(cwd, 'modules/SConscript'), variant_dir="modu
 src.extend(SConscript(os.path.join(cwd, 'gui/SConscript'), variant_dir="gui", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'modules/mem/SConscript'), variant_dir="modules_mem", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'hal_port/SConscript'), variant_dir="hal_port", duplicate=0))
-# src.extend(SConscript(os.path.join(cwd, 'gui/SConscript'), variant_dir="gui", duplicate=0)) # 等你建了 gui 文件夹再取消注释
+src.extend(SConscript(os.path.join(cwd, 'apps/SConscript'), variant_dir="apps", duplicate=0))
 
 # 2. 修复 lang_pack.h：加载多语言和字体资源
 Execute(Mkdir('gui/resource/strings')) # 确保目录存在
 Execute(Mkdir('gui/resource/fonts')) # 确保目录存在
 src.extend(SConscript(os.path.join(cwd, 'gui/resource/strings/SConscript'), variant_dir="resource_strings", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'gui/resource/fonts/SConscript'), variant_dir="resource_fonts", duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'gui/resource/fonts/bitmap/SConscript'), variant_dir="resource_bitmap_fonts", duplicate=0))
 
 group = DefineGroup('app', src, depend = ['PKG_USING_LITTLEVGL2RTT'], CPPPATH = inc)
 Return('group')
