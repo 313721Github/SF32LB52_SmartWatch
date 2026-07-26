@@ -1,9 +1,10 @@
-# 忽略编译生成的文件夹和文件
+# 蹇界暐缂栬瘧鐢熸垚鐨勬枃浠跺す鍜屾枃浠 
 project/build_*/
 project/pc_*/
 project/.sconsign.dblite
 project/__pycache__/
 
-# 忽略 VS Code 本地配置（可选，如果你不想共享本地路径）
+# 蹇界暐 VS Code 鏈湴閰嶇疆锛堝彲閫夛紝濡傛灉浣犱笉鎯冲叡浜湰鍦拌矾寰勶級
 .vscode/
 *.code-workspace
+.claude/
