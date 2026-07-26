@@ -1,10 +1,12 @@
-# 蹇界暐缂栬瘧鐢熸垚鐨勬枃浠跺す鍜屾枃浠 
+# 忽略编译生成的目录和文件
 project/build_*/
 project/pc_*/
 project/.sconsign.dblite
 project/__pycache__/
 
-# 蹇界暐 VS Code 鏈湴閰嶇疆锛堝彲閫夛紝濡傛灉浣犱笉鎯冲叡浜湰鍦拌矾寰勶級
+# 忽略 VS Code 本地开发配置
 .vscode/
 *.code-workspace
+
+# 忽略本地 AI 辅助工具配置
 .claude/

@@ -3,7 +3,6 @@
 #include "drv_io.h"
 #include "stdio.h"
 #include "string.h"
-#include "drivers/rt_drv_pwm.h"
 
 #define LCD_WIDTH  390
 #define LCD_HEIGHT 450
@@ -39,41 +38,25 @@ int main(void)
     /* Wait for panel power-up and init sequence to complete */
     rt_thread_mdelay(100);
 
-    /* Step 2: Set backlight brightness via PWM (ELVDD supply for AMOLED) 
-        
-    * Set the generic LCD backlight PWM through lcdlight.
-    * PA01 BL_PWM is intended for compatible TFT panels.
-    * It has no observable brightness-control effect on the
-    * current ZC-A1D85W-010 AMOLED module.
-      
-    */
-    rt_device_t lcd_light_dev = rt_device_find("lcdlight");
-    if (lcd_light_dev != RT_NULL)
-    {
-        rt_device_open(lcd_light_dev, RT_DEVICE_OFLAG_RDWR);
-        uint8_t brightness = 50;
-        rt_device_write(lcd_light_dev, 0, &brightness, 1);
-        rt_kprintf("LCD Backlight PWM set to 50%%.\n");
-    }
 
-    /*
-     * Step 3: Wait for LCD open to complete.
-     * rt_device_open("lcd") is async, so use a sync control call (SET_BRIGHTNESS)
-     * as a barrier to ensure the LCD task has finished OPEN processing.
-     */
+/*
+ * Step 2: Set the current AMOLED brightness through CO5300.
+ * rt_device_open("lcd") is asynchronous, so this synchronous control call
+ * also waits until lcd_task finishes the OPEN operation.
+ */
     uint32_t br = 100;
     rt_device_control(lcd_dev, RTGRAPHIC_CTRL_SET_BRIGHTNESS, &br);
     rt_kprintf("LCD ready, brightness set.\n");
 
     /*
-     * Step 4: Set framebuffer pixel format BEFORE drawing.
+     * Step 3: Set framebuffer pixel format BEFORE drawing.
      * The LCD_MSG_OPEN handler calls HAL_LCDC_LayerReset which clears the
      * layer data_format to 0. This control call reconfigures it for RGB565.
      */
     uint16_t format = RTGRAPHIC_PIXEL_FORMAT_RGB565;
     rt_device_control(lcd_dev, RTGRAPHIC_CTRL_SET_BUF_FORMAT, &format);
 
-    /* Step 5: Fill screen white in chunks.
+    /* Step 4: Fill screen white in chunks.
      * Panel RAMWR (0x2C) resets address to window start each call,
      * so batch CHUNK_ROWS rows per set_window+draw_rect pair. */
     memset(chunk_buf, 0xFF, sizeof(chunk_buf));  /* 0xFFFF = white in RGB565 */
