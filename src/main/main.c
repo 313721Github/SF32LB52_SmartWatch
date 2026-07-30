@@ -3,6 +3,7 @@
 #include "drv_io.h"
 #include "stdio.h"
 #include "string.h"
+#include "system_diag.h"
 
 #define LCD_WIDTH  390
 #define LCD_HEIGHT 450
@@ -19,6 +20,18 @@ static uint16_t chunk_buf[CHUNK_ROWS * LCD_WIDTH];
 int main(void)
 {
     rt_kprintf("Hello world!\n");
+    rt_kprintf("[BOOT][00][INFO] application entered\n");
+
+    if (system_diag_init() == RT_EOK)
+    {
+        system_diag_print_boot_info();
+        rt_kprintf("[BOOT][01][OK] system information ready\n");
+    }
+    else
+    {
+        rt_kprintf("[BOOT][01][ERR] system diagnostic init failed\n");
+    }
+
 
     /* Step 1: Open LCD graphic device to power up and initialize the panel */
     rt_device_t lcd_dev = rt_device_find("lcd");
