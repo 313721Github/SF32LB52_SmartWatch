@@ -4,6 +4,7 @@
 #include "stdio.h"
 #include "string.h"
 #include "system_diag.h"
+#include "indicator_port.h"
 
 #define LCD_WIDTH  390
 #define LCD_HEIGHT 450
@@ -22,6 +23,7 @@ int main(void)
     rt_kprintf("Hello world!\n");
     rt_kprintf("[BOOT][00][INFO] application entered\n");
 
+    //0、系统诊断信息测试
     if (system_diag_init() == RT_EOK)
     {
         system_diag_print_boot_info();
@@ -31,6 +33,59 @@ int main(void)
     {
         rt_kprintf("[BOOT][01][ERR] system diagnostic init failed\n");
     }
+
+
+    //1、RGB指示灯测试
+    if (indicator_init() == RT_EOK)
+    {
+        //1、黑色——关闭
+        if(indicator_set_state(INDICATOR_STATE_OFF) == RT_EOK)
+        {
+            rt_kprintf("[BOOT][02][OK] indicator ready\n");
+        }
+        rt_thread_mdelay(1000);
+        
+        //2、蓝色——启动中
+        if(indicator_set_state(INDICATOR_STATE_BOOTING) == RT_EOK)
+        {
+            rt_kprintf("[BOOT][02][OK] BOOTING ready\n");
+        }
+        rt_thread_mdelay(1000);
+
+        //3、绿色——正常
+        if(indicator_set_state(INDICATOR_STATE_READY) == RT_EOK)
+        {
+            rt_kprintf("[BOOT][02][OK] READY ready\n");
+        }
+        rt_thread_mdelay(1000);
+
+        //4、黄色——降级
+        if(indicator_set_state(INDICATOR_STATE_DEGRADED) == RT_EOK)
+        {
+            rt_kprintf("[BOOT][02][OK] DEGRADED ready\n");
+        }
+        rt_thread_mdelay(1000);
+
+        //5、红色——严重错误
+        if(indicator_set_state(INDICATOR_STATE_FATAL) == RT_EOK)
+        {
+            rt_kprintf("[BOOT][02][OK] FATAL ready\n");
+        }
+        rt_thread_mdelay(1000);
+
+        //6、黑色——关闭
+        if(indicator_set_state(INDICATOR_STATE_OFF) == RT_EOK)
+        {
+            rt_kprintf("[BOOT][02][OK] OFF\n");
+        }
+        rt_thread_mdelay(1000);
+
+    }
+    else
+    {
+        rt_kprintf("[BOOT][02][ERR] indicator init failed\n");
+    }   
+
 
 
     /* Step 1: Open LCD graphic device to power up and initialize the panel */
