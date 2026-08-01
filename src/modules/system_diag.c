@@ -28,6 +28,12 @@
 #include "system_diag.h"
 #include "bf0_hal.h"
 
+
+rt_err_t system_diag_init(void);
+const system_diag_info_t *system_diag_get_info(void);
+void system_diag_print_boot_info(void);
+
+
 static  system_diag_info_t g_system_info=
 {
     .project_name = "SF32LB52 SmartWatch",

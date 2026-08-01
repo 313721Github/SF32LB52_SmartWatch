@@ -1,5 +1,7 @@
 #ifndef SYSTEM_DIAG_H
 #define SYSTEM_DIAG_H
+//项目版本与启动诊断：让串口日志能够回答“这是什么固件、基于什么SDK、为什么启动、初始化到哪里”。
+
 
 #include "rtthread.h"
 #include <stdint.h>
