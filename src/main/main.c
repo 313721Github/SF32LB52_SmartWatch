@@ -5,6 +5,7 @@
 #include "string.h"
 #include "system_diag.h"
 #include "indicator_port.h"
+#include "button_port.h"
 
 #define LCD_WIDTH  390
 #define LCD_HEIGHT 450
@@ -85,6 +86,17 @@ int main(void)
     {
         rt_kprintf("[BOOT][02][ERR] indicator init failed\n");
     }   
+
+    rt_err_t result = button_port_init();
+
+    if (result == RT_EOK)
+    {
+        rt_kprintf("[BUTTON][INIT][OK]\n");
+    }
+    else
+    {
+        rt_kprintf("[BUTTON][INIT][ERROR] result=%d\n", result);
+    }
 
 
 
