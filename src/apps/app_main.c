@@ -2,6 +2,7 @@
 #include "indicator_port.h"
 #include "button_port.h"
 
+#include "rthw.h"
 
 #define APP_EVENT_QUEUE_DEPTH  8U  
 #define APP_THREAD_STACK_SIZE  2048U
@@ -18,11 +19,16 @@ static rt_uint32_t g_consume_count;         //接收队列消息数量
 static rt_bool_t g_indicator_available=RT_FALSE;                    // 硬件能不能控制
 static indicator_state_t g_app_indicator_state=INDICATOR_STATE_OFF; // 当前显示什么状态
 
+static rt_bool_t g_button_available = RT_FALSE;                     //按键初始化完成
+static rt_bool_t g_app_initialized = RT_FALSE;                      //应用核心初始化成功
+
 rt_err_t app_main_init(void);
 rt_err_t app_event_post(const app_event_t *event);
 static rt_err_t app_button_event_handler(const button_event_t *button_event,void *user_data);//应用层按键回调
 static void app_thread_entry(void *parameter);          //g_app_thread线程入口,接收mq
 static void app_handle_event(const app_event_t *event); //接收消息后的处理函数
+static rt_err_t app_indicator_selftest(void);            //RGB自检
+static rt_err_t indicator_selftest(void);                //向队列投递RGB自检
 
 //shell测试
 static rt_err_t app_diag_request(void);
@@ -33,6 +39,16 @@ static int app_event_flood(void);
 rt_err_t app_main_init(void)
 {
     rt_err_t result;
+
+    if (g_app_initialized == RT_TRUE)
+    {
+        rt_kprintf("[APP][INIT][WARN] application already initialized\n");
+        return RT_EOK;
+    }
+
+    g_button_available = RT_FALSE;
+    g_indicator_available = RT_FALSE;
+    g_app_indicator_state = INDICATOR_STATE_OFF;
 
     rt_kprintf("[APP][INIT] start\n");
 
@@ -110,6 +126,7 @@ rt_err_t app_main_init(void)
     result = button_port_register_handler(app_button_event_handler, RT_NULL);
     if (result != RT_EOK)
     {
+        g_button_available=RT_FALSE;
         rt_kprintf("[APP][INIT][WARN] button handler register failed: %d\n",
                 result);
     }
@@ -118,12 +135,31 @@ rt_err_t app_main_init(void)
         result = button_port_init();
         if (result != RT_EOK)
         {
+            g_button_available=RT_FALSE;
             rt_kprintf("[APP][INIT][WARN] button init failed: %d\n",
                     result);
         }
+        else
+        {
+            g_button_available=RT_TRUE;
+        }
     }
 
-    rt_kprintf("[APP][INIT][OK] application ready\n");
+    g_app_initialized=RT_TRUE;
+    if ((g_indicator_available == RT_TRUE) &&
+        (g_button_available == RT_TRUE))
+    {
+        rt_kprintf("[APP][INIT][OK] application ready\n");
+    }
+    else
+    {
+        rt_kprintf("[APP][INIT][WARN] "
+                "application ready in degraded mode "
+                "button=%u indicator=%u\n",
+                (unsigned int)g_button_available,
+                (unsigned int)g_indicator_available);
+    }
+
     return RT_EOK;
 
 }
@@ -217,6 +253,7 @@ static rt_err_t app_button_event_handler(const button_event_t *button_event,void
 rt_err_t app_event_post(const app_event_t *event)
 {
     rt_err_t result;
+    app_event_t event_copy;
 
     /* 防止调用者传入空指针 */
     if(event==RT_NULL)
@@ -241,9 +278,10 @@ rt_err_t app_event_post(const app_event_t *event)
      * rt_mq_send()不等待空闲空间。
      * 队列已满时立即返回错误，适合按键回调或定时器回调。
      */
+    event_copy=*event;
     result =rt_mq_send(
         g_event_queue,
-        event,
+        &event_copy,
         sizeof(app_event_t)
     );
     if(result != RT_EOK)
@@ -374,6 +412,9 @@ static void app_handle_event(const app_event_t *event)
                     g_event_post_count,
                     g_event_drop_count);
             break;
+        case APP_EVENT_INDICATOR_SELF_TEST:
+            app_indicator_selftest();
+            break;
 
         default:
             /* DOWN和UP现阶段可以只记录，不产生业务动作 */
@@ -384,6 +425,74 @@ static void app_handle_event(const app_event_t *event)
 
 }
 
+//RGB自检
+static rt_err_t app_indicator_selftest(void)
+{
+    indicator_state_t state;
+    indicator_state_t saved_state;
+    rt_err_t result;
+    rt_err_t restore_result;
+
+    if (g_indicator_available != RT_TRUE)
+    {
+        rt_kprintf(
+            "[APP][SELFTEST][ERROR] indicator unavailable\n");
+        return -RT_ERROR;
+    }
+
+    saved_state = g_app_indicator_state;
+
+    rt_kprintf(
+        "[APP][SELFTEST] indicator test start, saved_state=%d\n",
+        (int)saved_state);
+
+    result = RT_EOK;
+
+    for (state = INDICATOR_STATE_BOOTING;
+         state < INDICATOR_STATE_COUNT;
+         state++)
+    {
+        rt_kprintf(
+            "[APP][SELFTEST] set state=%d\n",
+            (int)state);
+
+        result = indicator_set_state(state);
+        if (result != RT_EOK)
+        {
+            rt_kprintf(
+                "[APP][SELFTEST][ERROR] "
+                "set state=%d failed: %d\n",
+                (int)state,
+                (int)result);
+            break;
+        }
+
+        rt_thread_mdelay(100);
+    }
+
+    /*
+     * 自检状态只是临时显示。
+     * 无论自检成功还是失败，都尝试恢复应用状态。
+     */
+    restore_result = indicator_set_state(saved_state);
+    if (restore_result != RT_EOK)
+    {
+        rt_kprintf(
+            "[APP][SELFTEST][ERROR] "
+            "restore state=%d failed: %d\n",
+            (int)saved_state,
+            (int)restore_result);
+
+        g_indicator_available = RT_FALSE;
+        return restore_result;
+    }
+
+    rt_kprintf(
+        "[APP][SELFTEST][OK] restored state=%d\n",
+        (int)saved_state);
+
+    return result;
+}
 
 //-----------------------------------------------------shell测试-----------------------------------------------------
 
@@ -401,23 +510,59 @@ static rt_err_t app_diag_request(void)
 
 }
 
-#ifdef RT_USING_FINSH
-MSH_CMD_EXPORT(app_diag_request,
-               post a diagnostic request to application queue);
-#endif
 
 static int app_stats(void)
 {
-    rt_kprintf("[APP][STATS] msg_size=%u depth=%u "
-               "posted=%u consumed=%u dropped=%u "
-               "indicator_available=%u indicator_state=%d\n",
-               (unsigned int)sizeof(app_event_t),
-               (unsigned int)APP_EVENT_QUEUE_DEPTH,
-               (unsigned int)g_event_post_count,
-               (unsigned int)g_consume_count,
-               (unsigned int)g_event_drop_count,
-               (unsigned int)g_indicator_available,
-               (int)g_app_indicator_state);
+    rt_bool_t initialized;
+    rt_bool_t queue_ready;
+    rt_bool_t thread_ready;
+    rt_bool_t button_available;
+    rt_bool_t indicator_available;
+
+    indicator_state_t indicator_state;
+
+    rt_uint32_t posted;
+    rt_uint32_t consumed;
+    rt_uint32_t dropped;
+
+    rt_base_t level;
+
+    //短暂关闭中断取得快照
+    level = rt_hw_interrupt_disable();
+
+    initialized = g_app_initialized;
+    queue_ready = (g_event_queue != RT_NULL) ?
+                  RT_TRUE : RT_FALSE;
+    thread_ready = (g_app_thread != RT_NULL) ?
+                   RT_TRUE : RT_FALSE;
+
+    button_available = g_button_available;
+    indicator_available = g_indicator_available;
+    indicator_state = g_app_indicator_state;
+
+    posted = g_event_post_count;
+    consumed = g_consume_count;
+    dropped = g_event_drop_count;
+
+    rt_hw_interrupt_enable(level);
+
+    rt_kprintf(
+        "[APP][STATS] initialized=%u queue=%u thread=%u\n",
+        (unsigned int)initialized,
+        (unsigned int)queue_ready,
+        (unsigned int)thread_ready);
+
+    rt_kprintf(
+        "[APP][STATS] button=%u indicator=%u state=%d\n",
+        (unsigned int)button_available,
+        (unsigned int)indicator_available,
+        (int)indicator_state);
+
+    rt_kprintf(
+        "[APP][STATS] posted=%u consumed=%u dropped=%u\n",
+        (unsigned int)posted,
+        (unsigned int)consumed,
+        (unsigned int)dropped);
 
     return 0;
 }
@@ -462,10 +607,32 @@ static int app_event_flood(void)
     return 0;
 }
 
+
+static rt_err_t indicator_selftest(void)
+{
+    app_event_t event =
+    {
+        .type   = APP_EVENT_INDICATOR_SELF_TEST,
+        .source = APP_EVENT_SOURCE_SYSTEM,
+        .tick   = rt_tick_get(),
+        .value  = 0
+    };
+
+    return app_event_post(&event);
+}
+
+#ifdef RT_USING_FINSH
+
+
+#endif
+
 #ifdef RT_USING_FINSH
 MSH_CMD_EXPORT(app_stats,
                show application event queue statistics);
 
 MSH_CMD_EXPORT(app_event_flood,
                inject events to verify queue full handling);
+MSH_CMD_EXPORT(indicator_selftest,
+               Perform RGB short-term self-test);
+
 #endif

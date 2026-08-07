@@ -97,4 +97,4 @@ rt_err_t indicator_set_state(indicator_state_t state)
     }
 
     return result;
-}   
+}

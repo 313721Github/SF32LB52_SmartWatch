@@ -27,12 +27,15 @@
 
 #include "system_diag.h"
 #include "bf0_hal.h"
+#ifdef RT_USING_FINSH
+#include <finsh.h>
+#endif
 
 
 rt_err_t system_diag_init(void);
 const system_diag_info_t *system_diag_get_info(void);
 void system_diag_print_boot_info(void);
-
+static int watch_info(void);
 
 static  system_diag_info_t g_system_info=
 {
@@ -78,5 +81,14 @@ void system_diag_print_boot_info(void)
 
 }
 
+static int watch_info(void)
+{
 
+    system_diag_print_boot_info();
+    return 0;
+}
 
+#ifdef RT_USING_FINSH
+MSH_CMD_EXPORT(watch_info,
+               show firmware version and boot information);
+#endif

@@ -105,13 +105,17 @@ rt_err_t button_port_read_raw(button_port_key_t key,rt_uint8_t *level); //读取
 rt_err_t button_port_register_handler(button_event_handler_t handler, void* userdata);
 
 /* 私有函数声明 */
-static int button_poll_test(int argc, char **argv);     //轮询测试按键原始电平，打印到串口
 static void button_gpio_isr(void *args);                //GPIO二级中断回调；
 static void button_debounce_timeout(void *parameter);   //30 ms后由timer线程运行
 static void button_long_timeout(void *parameter);       //长按定时器回调
 static button_event_handler_t g_event_handler = RT_NULL;
 static void *g_event_user_data = RT_NULL;
 static void button_emit_event(button_port_context_t *context,button_event_type_t type,rt_uint32_t duration_ms);//按键事件发送函数
+
+//shell测试函数
+static int button_poll_test(int argc, char **argv);     //轮询测试按键原始电平，打印到串口
+static int button_stats(int argc, char **argv);
+static int button_raw(void);
     //
 //初始化按键输入
 rt_err_t button_port_init(void)
@@ -619,7 +623,7 @@ static void button_long_timeout(void *parameter)
 
 
 //-------------------------------------------------测试-------------------------------------------------
-static int button_stats(int argc, char **argv);
+
 
 typedef struct
 {
@@ -721,10 +725,41 @@ static int button_stats(int argc, char **argv)
     return RT_EOK;
 }
 
+static int button_raw(void)
+{
+    rt_uint8_t key1_level;
+    rt_uint8_t key2_level;
+    rt_err_t result;
+
+    result = button_port_read_raw(BUTTON_PORT_KEY1, &key1_level);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[BUTTON][RAW][ERROR] KEY1 read failed: %d\n",
+                   (int)result);
+        return (int)result;
+    }
+
+    result = button_port_read_raw(BUTTON_PORT_KEY2, &key2_level);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[BUTTON][RAW][ERROR] KEY2 read failed: %d\n",
+                   (int)result);
+        return (int)result;
+    }
+
+    rt_kprintf("[BUTTON][RAW] KEY1=%u KEY2=%u active=high\n",
+               (unsigned int)key1_level,
+               (unsigned int)key2_level);
+
+    return 0;
+}
+
 
 #ifdef RT_USING_FINSH
 MSH_CMD_EXPORT(button_poll_test,
                poll raw KEY1 and KEY2 levels for 20 seconds);
 MSH_CMD_EXPORT(button_stats,
                show button interrupt and event statistics);
+MSH_CMD_EXPORT(button_raw,
+               show raw KEY1 and KEY2 levels);
 #endif
