@@ -205,7 +205,7 @@ project/build_sf32lb52-lchspi-ulp_hcpu/
 从 `project` 目录执行：
 
 ```powershell
-.\build_sf32lb52-lchspi-ulp_hcpu\uart_download.bat
+.\build_sf32lb52-lchspi-ulp_hcpu\uart_download.bat  
 ```
 
 脚本会提示输入串口数字。例如设备是COM12时，输入：
