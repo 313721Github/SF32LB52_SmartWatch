@@ -4,12 +4,12 @@
 
 #include "rthw.h"
 
-#define APP_EVENT_QUEUE_DEPTH  8U  
+#define APP_EVENT_QUEUE_DEPTH  8U
 #define APP_THREAD_STACK_SIZE  2048U
 #define APP_THREAD_PRIORITY    18U
 #define APP_THREAD_TIMESLICE   10U
 
-static rt_mq_t g_event_queue=RT_NULL;  
+static rt_mq_t g_event_queue=RT_NULL;
 static rt_thread_t g_app_thread=RT_NULL;
 
 static rt_uint32_t g_event_post_count;
@@ -55,7 +55,7 @@ rt_err_t app_main_init(void)
     /*
      * 1. 先创建队列。
      * 每条消息大小为sizeof(app_event_t)，最多存放APP_EVENT_QUEUE_DEPTH条消息。
-     */ 
+     */
     g_event_queue=rt_mq_create(
         "app_evt",
         sizeof(app_event_t),
@@ -69,7 +69,7 @@ rt_err_t app_main_init(void)
     /*
      * 2. 初始化RGB指示模块。
      * RGB失败不阻止系统继续启动，但要保存错误日志。
-     */ 
+     */
     result=indicator_init();
     if (result != RT_EOK)
     {
@@ -241,9 +241,9 @@ static rt_err_t app_button_event_handler(const button_event_t *button_event,void
     }
 
     return app_event_post(&app_event);
-    
 
-   
+
+
 
 }
 
@@ -266,7 +266,7 @@ rt_err_t app_event_post(const app_event_t *event)
     {
         return -RT_ERROR;
     }
-   
+
     if ((event->source >= APP_EVENT_SOURCE_COUNT) ||
     (event->type <= APP_EVENT_NONE) ||
     (event->type >= APP_EVENT_TYPE_COUNT))
@@ -290,7 +290,7 @@ rt_err_t app_event_post(const app_event_t *event)
         return result;
 
     }
-    
+
     g_event_post_count++;
     return RT_EOK;
 
@@ -326,7 +326,7 @@ static void app_thread_entry(void *parameter)
            (int)event.source,
            (unsigned int)event.tick,
            (unsigned int)event.value);
-            app_handle_event(&event);   
+            app_handle_event(&event);
         }
         else
         {
@@ -336,7 +336,7 @@ static void app_thread_entry(void *parameter)
         }
 
     }
-    
+
 
 }
 
@@ -360,8 +360,8 @@ static void app_handle_event(const app_event_t *event)
                 * KEY1保留HOME/PWRKEY语义。
                 * 当前只记录，不控制RGB。
                 */
-                rt_kprintf("[APP][KEY1] HOME short press\n");  
-                break;            
+                rt_kprintf("[APP][KEY1] HOME short press\n");
+                break;
             }
             else if(event->source==APP_EVENT_SOURCE_KEY2)
             {
@@ -387,7 +387,7 @@ static void app_handle_event(const app_event_t *event)
 
 
                 break;
-            }           
+            }
             break;
         case APP_EVENT_KEY_LONG:
             if(event->source==APP_EVENT_SOURCE_KEY1)

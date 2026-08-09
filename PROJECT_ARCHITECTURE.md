@@ -1,8 +1,8 @@
 # SmartWatch 项目架构与构建说明
 
-> 适用项目：`D:\Embedded_App\SF32LB52\SiFil_Project\SmartWatch_Project`  
-> 适用SDK：SiFli SDK v2.4.6，`release/v2.4`  
-> 当前开发板：黄山派 SF32LB52-ULP  
+> 适用项目：`D:\Embedded_App\SF32LB52\SiFil_Project\SmartWatch_Project`
+> 适用SDK：SiFli SDK v2.4.6，`release/v2.4`
+> 当前开发板：黄山派 SF32LB52-ULP
 > 当前板型参数：`sf32lb52-lchspi-ulp`
 
 ## 1. 先理解项目与SDK的关系
@@ -205,7 +205,7 @@ project/build_sf32lb52-lchspi-ulp_hcpu/
 从 `project` 目录执行：
 
 ```powershell
-.\build_sf32lb52-lchspi-ulp_hcpu\uart_download.bat  
+.\build_sf32lb52-lchspi-ulp_hcpu\uart_download.bat
 ```
 
 脚本会提示输入串口数字。例如设备是COM12时，输入：

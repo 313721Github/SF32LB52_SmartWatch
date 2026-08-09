@@ -51,7 +51,7 @@ typedef struct
 //KEY1 KEY2轮询验证
 
 static rt_bool_t g_button_initialized = RT_FALSE; //标记是否已初始化
-static const rt_base_t g_button_pin_table[BUTTON_PORT_KEY_COUNT] = 
+static const rt_base_t g_button_pin_table[BUTTON_PORT_KEY_COUNT] =
 {   [BUTTON_PORT_KEY1] = BSP_KEY1_PIN,
     [BUTTON_PORT_KEY2] = BSP_KEY2_PIN
 }; //KEY1/KEY2对应的GPIO引脚号
@@ -204,7 +204,7 @@ rt_err_t button_port_init(void)
                   rt_tick_from_millisecond(BUTTON_LONG_PRESS_MS),
                   RT_TIMER_FLAG_ONE_SHOT |RT_TIMER_FLAG_SOFT_TIMER);
 
-    
+
 
     //注册KEY1GPIO中断回调
     result = rt_pin_attach_irq(g_button_pin_table[BUTTON_PORT_KEY1],
@@ -225,7 +225,7 @@ rt_err_t button_port_init(void)
     {
         g_button_initialized = RT_FALSE;
         return result;
-    }  
+    }
     //使能KEY1/KEY2 GPIO中断
     result = rt_pin_irq_enable(g_button_pin_table[BUTTON_PORT_KEY1], PIN_IRQ_ENABLE);
     if(result != RT_EOK)
@@ -420,7 +420,7 @@ static void button_emit_event(button_port_context_t *context,button_event_type_t
     event.type=type;
     event.tick=rt_tick_get();
     event.duration_ms=duration_ms;
-    
+
     if(g_event_handler==RT_NULL)
     {
         return;
@@ -448,7 +448,7 @@ static void button_gpio_isr(void *args)
     context->last_irq_level=(rt_pin_read(context->pin)==PIN_LOW)?0U:1U; //上次中断触发时的电平
     context->last_irq_tick=rt_tick_get();   //上次中断触发时的系统节拍
     context->irq_count++;                   //GPIO原始中断次数
-   
+
     result = rt_timer_start(&context->debounce_timer);
     if (result != RT_EOK)
     {
@@ -529,7 +529,7 @@ static void button_debounce_timeout(void *parameter)
         rt_tick_t long_press_ticks =rt_tick_from_millisecond(BUTTON_LONG_PRESS_MS);
 
         context->release_count++;
-        
+
         if (context->long_reported == RT_FALSE)
         {
             result = rt_timer_stop(&context->long_timer);
@@ -602,7 +602,7 @@ static void button_long_timeout(void *parameter)
     {
         return;
     }
-    
+
     current_level = (rt_pin_read(context->pin) == PIN_LOW) ? 0U : 1U;
 
     //判断是否发生长按
