@@ -7,7 +7,7 @@
 typedef enum
 {
     BUTTON_PORT_KEY1=0,
-    BUTTON_PORT_KEY2, 
+    BUTTON_PORT_KEY2,
     BUTTON_PORT_KEY_COUNT
 }button_port_key_t;
 
@@ -27,8 +27,8 @@ typedef enum
 发生了什么：DOWN/UP/SHORT/LONG
 何时发生：tick
 持续多久：duration_ms
-*/ 
-typedef struct 
+*/
+typedef struct
 {
     /* data */
     button_port_key_t key;

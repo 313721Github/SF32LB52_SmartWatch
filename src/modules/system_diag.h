@@ -24,4 +24,3 @@ const system_diag_info_t *system_diag_get_info(void);   //获取系统诊断信�
 void system_diag_print_boot_info(void); //打印系统启动信息
 
 #endif
-

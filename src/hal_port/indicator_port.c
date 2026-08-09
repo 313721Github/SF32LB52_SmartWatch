@@ -44,11 +44,11 @@ static rt_err_t indicator_write_color(rt_uint32_t color)
 //返回：RT_EOK表示成功，负错误码表示失败
 rt_err_t indicator_init(void)
 {
-    
+
     rt_err_t result;
 
      /* 1. PA32切换为PWM输出功能 */
-    HAL_PIN_Set(PAD_PA32, GPTIM2_CH1, PIN_NOPULL, 1); 
+    HAL_PIN_Set(PAD_PA32, GPTIM2_CH1, PIN_NOPULL, 1);
      /* 2. 打开外围3.3V LDO，为RGB灯珠供电 */
     HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, true, true);
     /* 等待短暂的电源稳定时间 */
@@ -65,7 +65,7 @@ rt_err_t indicator_init(void)
     {
         rt_kprintf("[RGB][OK] rgbled device found\n");
     }
-    
+
     result = indicator_write_color(RGB_COLOR_BLACK);
     if (result != RT_EOK)
     {
@@ -89,7 +89,7 @@ rt_err_t indicator_set_state(indicator_state_t state)
         rt_kprintf("[RGB][ERR] invalid indicator state\n");
         return -RT_EINVAL;
     }
-  
+
     result= indicator_write_color(g_indicator_color_table[state]);
     if (result == RT_EOK)
     {
