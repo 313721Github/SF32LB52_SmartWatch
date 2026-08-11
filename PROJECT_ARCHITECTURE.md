@@ -1,9 +1,10 @@
 # SmartWatch 项目架构与构建说明
 
 > 适用项目：`D:\Embedded_App\SF32LB52\SiFil_Project\SmartWatch_Project`
-> 适用SDK：SiFli SDK v2.4.6，`release/v2.4`
+> 适用SDK：SiFli SDK v2.4.6，`baseline/phase0-sdk-lcd@ed3d0dfe`
 > 当前开发板：黄山派 SF32LB52-ULP
 > 当前板型参数：`sf32lb52-lchspi-ulp`
+> 当前项目基线：`feature/phase1-min-system@476b7c13`，tag为`phase1-min-system`
 
 ## 1. 先理解项目与SDK的关系
 
@@ -272,12 +273,12 @@ SmartWatch_Project/
 │  ├─ SConscript                 # 登记项目各源码子目录和公共头文件路径
 │  ├─ main/
 │  │  ├─ SConscript             # 把main.c加入构建
-│  │  └─ main.c                 # RT-Thread应用main线程入口；当前为LCD白屏冒烟测试
-│  ├─ hal_port/                  # 未来的项目级硬件适配封装
-│  ├─ modules/                   # 未来的传感器、BLE、存储、电源等服务/模块
+│  │  └─ main.c                 # RT-Thread应用main线程入口；当前负责诊断与应用启动
+│  ├─ hal_port/                  # button_port和indicator_port等项目级硬件适配
+│  ├─ modules/                   # app_event、system_diag及后续服务模块
 │  │  └─ mem/                    # 已有图形缓存和SRAM/PSRAM内存辅助代码
-│  ├─ gui/                       # 未来的LVGL页面和资源
-│  └─ apps/                      # 未来的手表应用与业务控制
+│  ├─ gui/                       # 阶段2将建立最小LVGL页面，现有资源尚未形成页面业务
+│  └─ apps/                      # app_main：应用队列、app线程和事件业务处理
 ├─ PROJECT_ARCHITECTURE.md       # 本说明文档
 └─ SmartWatch.code-workspace     # 同时打开项目与SDK的VS Code工作区
 ```
@@ -336,15 +337,49 @@ SmartWatch_Project/
 
 它是RT-Thread启动完成后创建的应用main线程入口，不是芯片复位后执行的第一段代码。
 
-当前程序用于LCD冒烟测试：
+当前`main()`已经从阶段0白屏冒烟测试收缩为应用启动入口：
 
-1. 打印Hello World；
-2. 查找并打开名为 `lcd` 的RT-Thread设备；
-3. 设置亮度和RGB565格式；
-4. 使用50行缓冲分块将390×450 AMOLED刷白；
-5. 进入带延时的循环。
+1. 打印应用入口日志；
+2. 调用`system_diag_init()`并输出项目、SDK提交和Reset原始信息；
+3. 调用`app_main_init()`创建应用运行环境；
+4. 核心初始化失败时返回错误码；
+5. 启动成功后打印`application ready`并返回。
 
-它证明显示设备链基本可用，但不是最终手表架构。后续不应把UI、传感器和BLE全部继续堆进该文件。
+阶段0白屏程序由`phase0-baseline-v2`保留。后续显示、传感器和BLE仍应进入各自模块，不继续堆入`main.c`。
+
+## 4.6 当前阶段1运行架构
+
+```text
+RT-Thread main线程
+→ main.c
+   ├─ system_diag_init()：版本、提交和Reset原始信息
+   └─ app_main_init()：创建应用运行环境
+
+app_main
+├─ 创建app_evt消息队列，深度8
+├─ 初始化indicator_port
+├─ 创建app线程，优先级18、栈2048字节
+├─ 注册按键事件回调
+└─ 初始化button_port
+
+GPIO边沿
+→ button_port GPIO ISR
+→ 30 ms消抖定时器/1000 ms长按定时器
+→ button_emit_event()
+→ app_main注册的按键事件回调
+→ app_event_post()
+→ app_evt消息队列
+→ app线程阻塞接收
+→ RGB状态或应用诊断
+
+indicator_port
+→ SDK rgbled设备
+→ PWM3 Update DMA
+→ PA32
+→ WS2812B-2020
+```
+
+这条边界表示：`button_port`只生成通用按键事件；`app_main`拥有应用队列并负责把按键事件转换为`app_event_t`；硬件适配层不直接依赖应用消息队列或RGB业务。
 
 ## 5. SCons构建链
 
@@ -367,6 +402,20 @@ project/SConstruct
   └─ GenDownloadScript(...)                → UART/J-Link下载脚本
 ```
 
+从源码收集职责看，构建层次是：
+
+```text
+project/SConstruct
+→ project/SConscript
+   ├─ SDK SConscript
+   └─ 项目src/SConscript
+       ├─ main/SConscript
+       ├─ modules/SConscript
+       ├─ hal_port/SConscript
+       ├─ apps/SConscript
+       └─ gui/SConscript
+```
+
 ## 6. SDK板级路径
 
 当前板型重点路径：
@@ -382,14 +431,14 @@ sifli-sdk/customer/peripherals/ft6146/
 
 ## 7. 当前源码状态
 
-| 目录 | 当前状态 | 阶段0处理方式 |
+| 目录 | 当前状态 | 后续处理方式 |
 |---|---|---|
-| `src/main` | 已有LCD白屏冒烟测试 | 理解并作为运行基线，不继续堆功能 |
-| `src/hal_port` | 只有构建骨架 | 阶段1/2再设计封装 |
-| `src/modules` | 大部分为空 | 传感器、BLE、存储阶段逐步建立 |
-| `src/modules/mem` | 已有复杂图形内存辅助代码 | 阶段0只读公开接口，不深入修改 |
+| `src/main` | 已收缩为诊断和应用启动入口 | 保持入口精简，不继续堆业务 |
+| `src/hal_port` | 已有`button_port`和`indicator_port` | 阶段2按相同边界设计显示侧薄封装 |
+| `src/modules` | 已有`app_event`和`system_diag` | 传感器、BLE、存储阶段逐步扩展 |
+| `src/modules/mem` | 已有复杂图形内存辅助代码 | 阶段2先只读调查，不先改变PSRAM布局 |
 | `src/gui` | 无实际页面，已有大量资源 | 阶段2建立最小页面，不先加载全部资源 |
-| `src/apps` | 只有构建骨架 | 阶段4建立业务应用 |
+| `src/apps` | 已有`app_main`、应用队列和app线程 | 阶段2保持阶段1事件闭环可回归 |
 
 ## 8. 常见错误排查顺序
 
