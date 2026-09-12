@@ -26,10 +26,39 @@ typedef struct
     rt_uint32_t draw_fail;      //绘制失败次数
     rt_uint32_t strip_count;    //累计处理的分条数量
 
+    rt_uint32_t brightness_attempt; //亮度设置尝试次数
+    rt_uint32_t brightness_success; //亮度设置成功次数
+    rt_uint32_t brightness_fail;    //亮度设置失败次数
+
+    rt_uint32_t power_on_attempt;   //开屏尝试次数
+    rt_uint32_t power_on_success;   //开屏成功次数
+    rt_uint32_t power_on_fail;      //开屏失败次数
+
+    rt_uint32_t power_off_attempt;  //关屏尝试次数
+    rt_uint32_t power_off_success;  //关屏成功次数
+    rt_uint32_t power_off_fail;     //关屏失败次数
+
     rt_uint32_t invalid_count;  //公开接口收到非法输入或状态不允许操作的次数
     rt_uint32_t close_fail;     //关闭LCD设备失败的次数
 } display_port_stats_t;
 
+
+//项目侧状态枚举
+typedef enum
+{
+    DISPLAY_PORT_STATE_CLOSED=0,        //设备没有由display_port保持打开
+    DISPLAY_PORT_STATE_INITIALIZED,    //设备已经初始化，但尚未通过当前测试重绘确认显示为ON
+    DISPLAY_PORT_STATE_ON,             //显示开启，可以执行绘制和亮度控制
+    DISPLAY_PORT_STATE_OFF             //已经执行POWEROFF，禁止绘制和设置亮度
+}display_port_state_t;
+
+//控制状态查询信息
+typedef struct
+{
+    display_port_state_t display_state;
+    rt_uint8_t last_brightness;
+    rt_bool_t brightness_valid;
+} display_port_control_state_t;
 
 //查找、打开并验证lcd设备，设置RGB565格式。
 rt_err_t  display_port_init(void);
@@ -42,5 +71,16 @@ rt_err_t display_port_deinit(void);
 
 rt_err_t display_port_get_info(display_port_info_t *info);
 rt_err_t display_port_get_stats(display_port_stats_t *stats);
+
+//设置屏幕亮度值
+rt_err_t display_port_set_brightness(rt_uint8_t percent);
+//关屏
+rt_err_t display_port_power_off(void);
+//开屏
+rt_err_t display_port_power_on(void);
+//查询当前状态
+rt_err_t display_port_get_control_state(display_port_control_state_t *state);
+//运行控制测试
+rt_err_t display_port_run_control_test(void);
 
 #endif
