@@ -1,8 +1,8 @@
 #include "app_main.h"
 #include "indicator_port.h"
 #include "button_port.h"
-
 #include "rthw.h"
+#include "ui_runtime.h"
 
 #define APP_EVENT_QUEUE_DEPTH  8U
 #define APP_THREAD_STACK_SIZE  2048U
@@ -21,9 +21,11 @@ static indicator_state_t g_app_indicator_state=INDICATOR_STATE_OFF; // 当前显
 
 static rt_bool_t g_button_available = RT_FALSE;                     //按键初始化完成
 static rt_bool_t g_app_initialized = RT_FALSE;                      //应用核心初始化成功
+static rt_bool_t g_ui_available = RT_FALSE;                         //ui模块是否初始化完成
 
 rt_err_t app_main_init(void);
 rt_err_t app_event_post(const app_event_t *event);
+static rt_err_t app_ui_event_handler(ui_runtime_event_t event,ui_failure_stage_t stage,rt_err_t error,void *user_data);//ui层回调
 static rt_err_t app_button_event_handler(const button_event_t *button_event,void *user_data);//应用层按键回调
 static void app_thread_entry(void *parameter);          //g_app_thread线程入口,接收mq
 static void app_handle_event(const app_event_t *event); //接收消息后的处理函数
@@ -149,7 +151,7 @@ rt_err_t app_main_init(void)
     if ((g_indicator_available == RT_TRUE) &&
         (g_button_available == RT_TRUE))
     {
-        rt_kprintf("[APP][INIT][OK] application ready\n");
+        rt_kprintf("[APP][INIT][OK] application core ready, starting UI\n");
     }
     else
     {
@@ -160,6 +162,49 @@ rt_err_t app_main_init(void)
                 (unsigned int)g_indicator_available);
     }
 
+    //ui模块初始化
+    app_event_t ui_event;
+    rt_err_t post_result;
+    g_ui_available = RT_FALSE;
+
+    result = ui_runtime_register_handler(app_ui_event_handler,RT_NULL);
+
+    if (result != RT_EOK)
+    {
+        /*
+        * TODO：
+        * 打印注册失败。
+        * 因为回调没有注册成功，这种情况无法由ui_runtime回调通知。
+        * 由app_main主动向app_evt投递一次UI_FAILED。
+        * 不要直接在这里宣称系统READY。
+        */
+        rt_kprintf("[APP][ui][WARN] ui handler register failed: %d\n",result);
+        ui_event.source=APP_EVENT_SOURCE_UI;
+        ui_event.tick=rt_tick_get();
+        ui_event.type=APP_EVENT_UI_FAILED;
+        ui_event.value=UI_FAILURE_HANDLER_REGISTER;
+        post_result= app_event_post(&ui_event);
+        if(post_result!=RT_EOK)
+        {
+            rt_kprintf("[APP][ui][WARN] ui handler register Msg post failed: %d\n",post_result);
+        }
+    }
+    else
+    {
+        result = ui_runtime_init();
+
+        if (result != RT_EOK)
+        {
+            /*
+            * 只打印启动失败。
+            * ui_runtime_init已经通过已注册回调发送UI_FAILED，
+            * 这里不要重复投递。
+            */
+            rt_kprintf(
+            "[APP][UI][ERROR] runtime start failed: %d\n",
+            result);
+        }
+    }
     return RT_EOK;
 
 }
@@ -247,6 +292,34 @@ static rt_err_t app_button_event_handler(const button_event_t *button_event,void
 
 }
 
+//ui层回调函数
+static rt_err_t app_ui_event_handler(ui_runtime_event_t event,ui_failure_stage_t stage,rt_err_t error,void *user_data)
+{
+    app_event_t app_event = {0};
+
+    (void)error;
+    (void)user_data;
+
+    app_event.source = APP_EVENT_SOURCE_UI;
+    app_event.tick = rt_tick_get();
+
+    if (event == UI_RUNTIME_EVENT_READY)
+    {
+        app_event.type = APP_EVENT_UI_READY;
+        app_event.value = 0U;
+    }
+    else if (event == UI_RUNTIME_EVENT_FAILED)
+    {
+        app_event.type = APP_EVENT_UI_FAILED;
+        app_event.value = (rt_uint32_t)stage;
+    }
+    else
+    {
+        return -RT_EINVAL;
+    }
+
+    return app_event_post(&app_event);
+}
 
 
 //消息队列投递
@@ -346,6 +419,7 @@ static void app_handle_event(const app_event_t *event)
 {
 
     indicator_state_t new_state;
+    rt_err_t set_state_result;
     if(event==RT_NULL)
     {
         return;
@@ -375,9 +449,14 @@ static void app_handle_event(const app_event_t *event)
                 }
                 if (g_indicator_available == RT_TRUE)
                 {
-                    if (indicator_set_state(new_state) == RT_EOK)
+                    set_state_result=indicator_set_state(new_state);
+                    if ( set_state_result== RT_EOK)
                     {
                         g_app_indicator_state = new_state;
+                    }
+                    else
+                    {
+                        rt_kprintf("[APP][KEY2][WARN] indicator_set_state failed:%d goal:%d\n",set_state_result,new_state);
                     }
                 }
                 else
@@ -399,9 +478,15 @@ static void app_handle_event(const app_event_t *event)
             {
                 if (g_indicator_available == RT_TRUE)
                 {
-                    if (indicator_set_state(INDICATOR_STATE_OFF) == RT_EOK)
+                    set_state_result=indicator_set_state(INDICATOR_STATE_OFF);
+                    if ( set_state_result== RT_EOK)
                     {
                         g_app_indicator_state = INDICATOR_STATE_OFF;
+                    }
+                    else
+                    {
+                        rt_kprintf("[APP][KEY2][WARN] indicator_set_state failed:%d goal:%d\n",set_state_result,INDICATOR_STATE_OFF);
+
                     }
                 }
                 break;
@@ -414,6 +499,54 @@ static void app_handle_event(const app_event_t *event)
             break;
         case APP_EVENT_INDICATOR_SELF_TEST:
             app_indicator_selftest();
+            break;
+        case APP_EVENT_UI_READY:
+            /*
+            * TODO：
+            * g_ui_available = RT_TRUE；打印UI ready；
+            * indicator可用时设置READY；
+            * 成功后更新g_app_indicator_state。
+            */
+           g_ui_available=RT_TRUE;
+           rt_kprintf("[APP][UI][READY] runtime available\n");
+           if(g_indicator_available == RT_TRUE)
+           {
+                set_state_result=indicator_set_state(INDICATOR_STATE_READY);
+                if ( set_state_result== RT_EOK)
+                {
+                    g_app_indicator_state = INDICATOR_STATE_READY;
+                }
+                else
+                {
+                    rt_kprintf("[APP][UI][WARN] indicator_set_state failed:%d goal:%d\n",set_state_result,INDICATOR_STATE_READY);
+                }
+           }
+
+            break;
+
+        case APP_EVENT_UI_FAILED:
+            /*
+            * TODO：
+            * g_ui_available = RT_FALSE；
+            * 打印event->value中的失败阶段；
+            * indicator可用时设置DEGRADED；
+            * 成功后更新g_app_indicator_state。
+            */
+           g_ui_available=RT_FALSE;
+           rt_kprintf("[APP][UI] UI failed; failed stage:%u\n", (unsigned int)event->value);
+           if(g_indicator_available == RT_TRUE)
+           {
+            set_state_result=indicator_set_state(INDICATOR_STATE_DEGRADED);
+            if (set_state_result== RT_EOK)
+            {
+                g_app_indicator_state = INDICATOR_STATE_DEGRADED;
+            }
+            else
+            {
+                 rt_kprintf("[APP][UI][WARN] indicator_set_state failed:%d goal:%d\n",set_state_result,INDICATOR_STATE_DEGRADED);
+
+            }
+           }
             break;
 
         default:
@@ -518,6 +651,7 @@ static int app_stats(void)
     rt_bool_t thread_ready;
     rt_bool_t button_available;
     rt_bool_t indicator_available;
+    rt_bool_t ui_available;
 
     indicator_state_t indicator_state;
 
@@ -539,6 +673,7 @@ static int app_stats(void)
     button_available = g_button_available;
     indicator_available = g_indicator_available;
     indicator_state = g_app_indicator_state;
+    ui_available=g_ui_available;
 
     posted = g_event_post_count;
     consumed = g_consume_count;
@@ -553,9 +688,10 @@ static int app_stats(void)
         (unsigned int)thread_ready);
 
     rt_kprintf(
-        "[APP][STATS] button=%u indicator=%u state=%d\n",
+        "[APP][STATS] button=%u indicator=%u ui=%u state=%d\n",
         (unsigned int)button_available,
         (unsigned int)indicator_available,
+        (unsigned int)ui_available,
         (int)indicator_state);
 
     rt_kprintf(
