@@ -3,6 +3,7 @@
 #include "button_port.h"
 #include "rthw.h"
 #include "ui_runtime.h"
+#include "ui_event.h"
 
 #define APP_EVENT_QUEUE_DEPTH  8U
 #define APP_THREAD_STACK_SIZE  2048U
@@ -31,7 +32,7 @@ static void app_thread_entry(void *parameter);          //g_app_thread线程入�
 static void app_handle_event(const app_event_t *event); //接收消息后的处理函数
 static rt_err_t app_indicator_selftest(void);            //RGB自检
 static rt_err_t indicator_selftest(void);                //向队列投递RGB自检
-
+static rt_err_t app_request_ui_action(ui_action_t action,ui_event_source_t source,rt_tick_t tick,rt_uint32_t value);    //构造局部ui_event_t
 //shell测试
 static rt_err_t app_diag_request(void);
 static int app_stats(void);
@@ -420,6 +421,7 @@ static void app_handle_event(const app_event_t *event)
 
     indicator_state_t new_state;
     rt_err_t set_state_result;
+    rt_err_t ui_result;
     if(event==RT_NULL)
     {
         return;
@@ -433,8 +435,15 @@ static void app_handle_event(const app_event_t *event)
                 /*
                 * KEY1保留HOME/PWRKEY语义。
                 * 当前只记录，不控制RGB。
+                * app线程只发布UI语义事件，不直接操作LVGL对象
                 */
                 rt_kprintf("[APP][KEY1] HOME short press\n");
+                //进行ui动作
+                ui_result=app_request_ui_action(UI_ACTION_HOME,UI_EVENT_SOURCE_KEY,event->tick,0u);
+                if(ui_result!=RT_EOK)
+                {
+                    rt_kprintf("[APP][KEY1][WARN] ui action failed:%d\n",(int)ui_result);
+                }
                 break;
             }
             else if(event->source==APP_EVENT_SOURCE_KEY2)
@@ -463,10 +472,32 @@ static void app_handle_event(const app_event_t *event)
                 {
                     rt_kprintf("[APP][INDICATOR][WARN] device unavailable\n");
                 }
+                /*
+                 * RGB业务成功、失败或不可用，都不阻止UI请求。
+                 * 两条业务链相互独立。
+                 */
+                //进行ui动作
+                ui_result=app_request_ui_action(UI_ACTION_NEXT,UI_EVENT_SOURCE_KEY,event->tick,0);
+                if(ui_result!=RT_EOK)
+                {
+                    rt_kprintf("[APP][KEY2][WARN] ui action failed:%d\n",ui_result);
+                }
 
 
                 break;
             }
+            else
+            {
+                /*
+                 * APP_EVENT_KEY_SHORT只接受KEY1或KEY2来源。
+                 * 不向UI队列发送来源不明的动作。
+                 */
+                rt_kprintf(
+                    "[APP][KEY][WARN] "
+                    "short event has invalid source: %d\n",
+                    (int)event->source);
+            }
+
             break;
         case APP_EVENT_KEY_LONG:
             if(event->source==APP_EVENT_SOURCE_KEY1)
@@ -757,6 +788,32 @@ static rt_err_t indicator_selftest(void)
     return app_event_post(&event);
 }
 
+/* 简介：构造并发布一条UI语义事件
+ * 输入：
+ *     action：UI动作类型
+ *     source：UI事件的抽象来源
+ *     tick：原始应用事件的发生tick
+ *     value：动作需要的值类型载荷
+ * 返回值：
+ *     RT_EOK：事件成功进入UI队列
+ *     其他：ui_event_post()返回的真实错误码
+ */
+static rt_err_t app_request_ui_action(ui_action_t action,ui_event_source_t source,rt_tick_t tick,rt_uint32_t value)
+{
+    ui_event_t event =
+    {
+        .type = action,
+        .source = source,
+        .tick = tick,
+        .value = value
+    };
+
+    /*
+     * rt_mq_send()会复制整个ui_event_t，
+     * 不会保存该局部变量的地址。
+     */
+    return ui_event_post(&event);
+}
 #ifdef RT_USING_FINSH
 
 

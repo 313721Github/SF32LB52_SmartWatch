@@ -8,7 +8,8 @@ static lv_obj_t *g_ui_label = RT_NULL;          //ui界面标签
 static rt_bool_t g_ui_page_created = RT_FALSE;  //ui界面是否创造成功
 
 //公开函数声明
-rt_err_t ui_page_create(void);
+rt_err_t ui_page_create(void);                              //创建ui界面
+rt_err_t ui_page_handle_event(const ui_event_t *event);     //ui事件处理函数
 //---------------------------------------------------------------公开函数---------------------------------------------------------------
 
 /*简介：创建ui界面
@@ -92,5 +93,54 @@ rt_err_t ui_page_create(void)
     lv_scr_load(g_ui_screen);
 
     g_ui_page_created = RT_TRUE;
+    return RT_EOK;
+}
+
+/*简介：ui事件处理函数
+  输入：event：ui事件
+  返回值：rt_err_t：错误类型
+*/
+rt_err_t ui_page_handle_event(const ui_event_t *event)
+{
+    if(event==RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    //检查ui界面是否创建
+    if(g_ui_page_created==RT_FALSE)
+    {
+
+        return -RT_EBUSY;
+    }
+
+    //检查screen和label有效
+    if(g_ui_screen==RT_NULL || g_ui_label==RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    //处理ui事件
+    switch (event->type)
+    {
+    case UI_ACTION_HOME:
+        lv_label_set_text(g_ui_label, "UI HOME");
+        break;
+    case UI_ACTION_NEXT:
+        lv_label_set_text(g_ui_label, "UI NEXT");
+        break;
+    case UI_ACTION_BACK:
+        lv_label_set_text(g_ui_label, "UI BACK");
+        break;
+        case UI_ACTION_REFRESH_STATUS:
+            lv_label_set_text_fmt(
+                g_ui_label,
+                "STATUS: %u",
+                (unsigned int)event->value);
+            break;
+    default:
+        return -RT_EINVAL;
+    }
+
     return RT_EOK;
 }
