@@ -477,7 +477,7 @@ static void app_handle_event(const app_event_t *event)
                  * 两条业务链相互独立。
                  */
                 //进行ui动作
-                ui_result=app_request_ui_action(UI_ACTION_NEXT,UI_EVENT_SOURCE_KEY,event->tick,0);
+                ui_result=app_request_ui_action(UI_ACTION_NEXT,UI_EVENT_SOURCE_KEY,event->tick,0U);
                 if(ui_result!=RT_EOK)
                 {
                     rt_kprintf("[APP][KEY2][WARN] ui action failed:%d\n",ui_result);
@@ -502,7 +502,12 @@ static void app_handle_event(const app_event_t *event)
         case APP_EVENT_KEY_LONG:
             if(event->source==APP_EVENT_SOURCE_KEY1)
             {
-                rt_kprintf("[APP][KEY1] long press reported\n");
+                rt_kprintf("[APP][KEY1] long press -> UI BACK\n");
+                ui_result=app_request_ui_action(UI_ACTION_BACK,UI_EVENT_SOURCE_KEY,event->tick,0U);
+                if(ui_result!=RT_EOK)
+                {
+                    rt_kprintf("[APP][KEY1][WARN] ui action failed:%d\n",ui_result);
+                }
                 break;
             }
             else if(event->source==APP_EVENT_SOURCE_KEY2)

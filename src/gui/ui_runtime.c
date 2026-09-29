@@ -1576,6 +1576,7 @@ static int ui_event_stress(void)
 static int ui_stats(void)
 {
     ui_runtime_stats_t stats;
+    ui_page_stats_t ui_page_stats;
     rt_err_t result;
 
     result = ui_runtime_get_stats(&stats);
@@ -1671,6 +1672,32 @@ static int ui_stats(void)
         (unsigned int)stats.recv_fail,
         (unsigned int)stats.last_latency_ticks,
         (unsigned int)stats.max_latency_ticks);
+
+    result = ui_page_get_stats(&ui_page_stats);
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[UI][STATS][ERROR] ui page get stats failed: %d\n",
+            (int)result);
+        return (int)result;
+    }
+
+    rt_kprintf("[UI][PAGE] created=%d current=%d\n",
+               (int)ui_page_stats.created,
+               (int)ui_page_stats.current_page);
+
+    rt_kprintf("[UI][PAGE] create attempt=%u success=%u fail=%u\n",
+               (unsigned int)ui_page_stats.create_attempt,
+               (unsigned int)ui_page_stats.create_success,
+               (unsigned int)ui_page_stats.create_fail);
+
+    rt_kprintf("[UI][PAGE] switch attempt=%u success=%u fail=%u noop=%u\n",
+               (unsigned int)ui_page_stats.switch_attempt,
+               (unsigned int)ui_page_stats.switch_success,
+               (unsigned int)ui_page_stats.switch_fail,
+               (unsigned int)ui_page_stats.switch_noop);
+
+
 
     return 0;
 }
