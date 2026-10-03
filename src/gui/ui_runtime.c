@@ -4,6 +4,8 @@
 #include "littlevgl2rtt.h"
 #include "lvgl.h"
 #include "lv_ex_data.h"
+#include "ui_touch_diag.h"
+#include <string.h>
 
 #ifdef RT_USING_FINSH
 #include "finsh.h"
@@ -423,15 +425,21 @@ static void ui_thread_entry(void *parameter)
         return;
     }
 
+    result = ui_touch_diag_create(lv_scr_act());
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[UI][TOUCH][CREATE_FAIL] error=%d\n", (int)result);
+
+        /* 使用当前页面创建失败处理路径，然后return退出初始化。 */
+        ui_runtime_thread_fail(UI_FAILURE_PAGE_CREATE, result);
+        return;
+    }
     /*
      * 第一次handler：
      * TODO 1：调用lv_timer_handler()。
      * TODO 2：归一化等待时间。
      * TODO 3：更新handler统计。
      */
-
-
-
     handler_return_ms=lv_task_handler();
     wait_ms=ui_runtime_normalize_wait(handler_return_ms);
     //更新handle统计信息
@@ -634,10 +642,34 @@ static rt_err_t ui_runtime_handle_event(const ui_event_t *event)
     else
     {
         /*
-         * 当前函数只由UI线程调用，
-         * 因此可以在这里安全操作LVGL页面对象。
+         * 事件合法，进入页面处理。
+        * 其中触摸诊断事件需要特殊处理：
          */
-        handle_result = ui_page_handle_event(event);
+        switch (event->type)
+        {
+        case UI_ACTION_TOUCH_DIAG_ENABLE:
+            handle_result = ui_touch_diag_set_enabled(RT_TRUE);
+            break;
+
+        case UI_ACTION_TOUCH_DIAG_DISABLE:
+            handle_result = ui_touch_diag_set_enabled(RT_FALSE);
+
+            // 触摸诊断界面关闭后，返回主界面
+            if (handle_result == RT_EOK)
+            {
+                ui_event_t home_event = *event;
+
+                home_event.type = UI_ACTION_HOME;
+                home_event.value = 0;
+
+                handle_result = ui_page_handle_event(&home_event);
+            }
+            break;
+
+        default:
+            handle_result = ui_page_handle_event(event);
+            break;
+        }
     }
 
     /*
@@ -1115,6 +1147,18 @@ static rt_bool_t ui_event_is_valid(const ui_event_t *event)
     if (event->type == UI_ACTION_HOME ||
         event->type == UI_ACTION_NEXT ||
         event->type == UI_ACTION_BACK)
+    {
+        if (event->value != 0)
+        {
+            return RT_FALSE;
+        }
+    }
+
+    if (event->type == UI_ACTION_HOME ||
+    event->type == UI_ACTION_NEXT ||
+    event->type == UI_ACTION_BACK ||
+    event->type == UI_ACTION_TOUCH_DIAG_ENABLE ||
+    event->type == UI_ACTION_TOUCH_DIAG_DISABLE)
     {
         if (event->value != 0)
         {
@@ -1701,6 +1745,93 @@ static int ui_stats(void)
 
     return 0;
 }
+static int ui_touch_diag(int argc, char **argv)
+{
+    ui_event_t event = {0};
+    ui_touch_diag_stats_t stats;
+    rt_err_t result;
+    rt_uint32_t index;
+
+    if (argc != 2)
+    {
+        rt_kprintf("usage: ui_touch_diag on|off|stats\n");
+        return -RT_EINVAL;
+    }
+
+    if (strcmp(argv[1], "stats") == 0)
+    {
+        result = ui_touch_diag_get_stats(&stats);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+
+        rt_kprintf(
+            "[UI][TOUCH][STATS] created=%d enabled=%d active=%d\n",
+            (int)stats.created, (int)stats.enabled,
+            (int)stats.pressed_active);
+
+        rt_kprintf(
+            "[UI][TOUCH][STATS] seq=%u pressed=%u pressing=%u "
+            "released=%u completed=%u\n",
+            (unsigned int)stats.event_sequence,
+            (unsigned int)stats.pressed_count,
+            (unsigned int)stats.pressing_count,
+            (unsigned int)stats.released_count,
+            (unsigned int)stats.completed_sequence_count);
+
+        rt_kprintf(
+            "[UI][TOUCH][STATS] out_of_range=%u press_lost=%u "
+            "press_without_release=%u release_without_press=%u\n",
+            (unsigned int)stats.out_of_range_count,
+            (unsigned int)stats.press_lost_count,
+            (unsigned int)stats.press_without_release_count,
+            (unsigned int)stats.release_without_press_count);
+
+        for (index = 0; index < UI_TOUCH_DIAG_TARGET_COUNT; index++)
+        {
+            rt_kprintf("[UI][TOUCH][HIT] target_id=%u count=%u\n",
+                       (unsigned int)index,
+                       (unsigned int)stats.target_hit_count[index]);
+        }
+
+        rt_kprintf(
+            "[UI][TOUCH][STATS] none_hit=%u last_event=%d "
+            "last=(%d,%d) target=%d error=%d\n",
+            (unsigned int)stats.none_hit_count,
+            (int)stats.last_event,
+            (int)stats.last_x, (int)stats.last_y,
+            (int)stats.last_target, (int)stats.last_error);
+
+        return RT_EOK;
+    }
+
+    if (strcmp(argv[1], "on") == 0)
+    {
+        event.type = UI_ACTION_TOUCH_DIAG_ENABLE;
+    }
+    else if (strcmp(argv[1], "off") == 0)
+    {
+        event.type = UI_ACTION_TOUCH_DIAG_DISABLE;
+    }
+    else
+    {
+        rt_kprintf("usage: ui_touch_diag on|off|stats\n");
+        return -RT_EINVAL;
+    }
+
+    event.source = UI_EVENT_SOURCE_TEST;
+    event.tick = rt_tick_get();
+    event.value = 0;
+
+    result = ui_event_post(&event);
+
+    rt_kprintf("[UI][TOUCH][REQUEST] action=%s post_result=%d\n",
+               argv[1], (int)result);
+
+    return result;
+}
+
 
 #ifdef RT_USING_FINSH
 
@@ -1711,5 +1842,9 @@ MSH_CMD_EXPORT(
 MSH_CMD_EXPORT(
     ui_event_stress,
     verify UI event queue full and recovery paths);
+
+    MSH_CMD_EXPORT(
+    ui_touch_diag,
+    touch diagnostic on off stats);
 
 #endif
