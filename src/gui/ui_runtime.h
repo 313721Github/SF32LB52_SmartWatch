@@ -89,6 +89,16 @@ typedef struct
     rt_tick_t last_latency_ticks;           //上一次事件从投递到消费的延迟tick数（最近一条事件的排队时间）
     rt_tick_t max_latency_ticks;            //最大延迟tick数，观测到的最大排队时间
 
+    rt_uint32_t max_inflight;               /* 最大未完成UI事件数 */
+
+    /* 最近一条合法事件的类型和来源。 */
+    ui_action_t last_action;
+    ui_event_source_t last_source;
+
+    /* 请求进入UI路径到页面处理完成的延迟。 */
+    rt_tick_t last_complete_latency_ticks;
+    rt_tick_t max_complete_latency_ticks;
+
 } ui_runtime_stats_t;
 
 //UI线程把READY或FAILED异步通知给app_main

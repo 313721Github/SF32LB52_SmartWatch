@@ -10,12 +10,21 @@
 #define APP_THREAD_PRIORITY    18U
 #define APP_THREAD_TIMESLICE   10U
 
+// Event stress test parameters
+#define APP_EVENT_STRESS_ATTEMPTS   (APP_EVENT_QUEUE_DEPTH * 2U)
+#define APP_EVENT_STRESS_TIMEOUT_MS 1000U
+#define APP_EVENT_STRESS_POLL_MS    10U
+#define APP_EVENT_RECOVERY_VALUE    0xA1100001U
+
 static rt_mq_t g_event_queue=RT_NULL;
 static rt_thread_t g_app_thread=RT_NULL;
 
 static rt_uint32_t g_event_post_count;
 static rt_uint32_t g_event_drop_count;
-static rt_uint32_t g_consume_count;         //接收队列消息数量
+static rt_uint32_t g_consume_count;             //接收队列消息数量
+static rt_uint32_t g_event_post_attempt_count;  //尝试投递事件次数
+static rt_uint32_t g_event_invalid_count;       //无效事件数量
+static rt_uint32_t g_event_max_inflight;        //最大在途事件数
 
 static rt_bool_t g_indicator_available=RT_FALSE;                    // 硬件能不能控制
 static indicator_state_t g_app_indicator_state=INDICATOR_STATE_OFF; // 当前显示什么状态
@@ -32,10 +41,18 @@ static void app_thread_entry(void *parameter);          //g_app_thread线程入�
 static void app_handle_event(const app_event_t *event); //接收消息后的处理函数
 static rt_err_t app_indicator_selftest(void);            //RGB自检
 static rt_err_t indicator_selftest(void);                //向队列投递RGB自检
-static rt_err_t app_request_ui_action(ui_action_t action,ui_event_source_t source,rt_tick_t tick,rt_uint32_t value);    //构造局部ui_event_t
+static rt_err_t app_request_ui_action(ui_action_t action,ui_event_source_t source,rt_uint32_t value);    //构造局部ui_event_t
+
+static void app_record_post_attempt(void);
+static void app_record_post_success(void);
+static void app_record_post_drop(void);
+static void app_record_invalid(void);
+static void app_record_consumed(void);
+
 //shell测试
 static rt_err_t app_diag_request(void);
 static int app_stats(void);
+static int task11_resources(void);
 static int app_event_flood(void);
 
 //初始化
@@ -335,24 +352,33 @@ rt_err_t app_event_post(const app_event_t *event)
         return -RT_EINVAL;
     }
 
-     /* 队列尚未创建，说明应用层没有完成初始化 */
-    if(g_event_queue==RT_NULL)
-    {
-        return -RT_ERROR;
-    }
+
+    app_record_post_attempt();
 
     if ((event->source >= APP_EVENT_SOURCE_COUNT) ||
     (event->type <= APP_EVENT_NONE) ||
     (event->type >= APP_EVENT_TYPE_COUNT))
     {
+        app_record_invalid();
         return -RT_EINVAL;
     }
 
+    /* 队列尚未创建，说明应用层没有完成初始化 */
+    if(g_event_queue==RT_NULL)
+    {
+        app_record_post_drop();
+        return -RT_ERROR;
+    }
     /*
      * rt_mq_send()不等待空闲空间。
      * 队列已满时立即返回错误，适合按键回调或定时器回调。
      */
     event_copy=*event;
+
+    /*
+     * 重要：正常业务发送必须保持非阻塞。
+     * 队列满时安全丢弃，不重试、不覆盖旧消息。
+     */
     result =rt_mq_send(
         g_event_queue,
         &event_copy,
@@ -360,12 +386,12 @@ rt_err_t app_event_post(const app_event_t *event)
     );
     if(result != RT_EOK)
     {
-        g_event_drop_count++;
+        app_record_post_drop();
         return result;
 
     }
 
-    g_event_post_count++;
+    app_record_post_success();
     return RT_EOK;
 
 }
@@ -392,7 +418,7 @@ static void app_thread_entry(void *parameter)
         );
         if(result==RT_EOK)
         {
-            g_consume_count++;
+            app_record_consumed();
             rt_kprintf("[APP][EVENT] seq=%u type=%d source=%d "
            "tick=%u value=%u\n",
            (unsigned int)g_consume_count,
@@ -439,7 +465,7 @@ static void app_handle_event(const app_event_t *event)
                 */
                 rt_kprintf("[APP][KEY1] HOME short press\n");
                 //进行ui动作
-                ui_result=app_request_ui_action(UI_ACTION_HOME,UI_EVENT_SOURCE_KEY,event->tick,0u);
+                ui_result=app_request_ui_action(UI_ACTION_HOME,UI_EVENT_SOURCE_KEY,0u);
                 if(ui_result!=RT_EOK)
                 {
                     rt_kprintf("[APP][KEY1][WARN] ui action failed:%d\n",(int)ui_result);
@@ -477,7 +503,7 @@ static void app_handle_event(const app_event_t *event)
                  * 两条业务链相互独立。
                  */
                 //进行ui动作
-                ui_result=app_request_ui_action(UI_ACTION_NEXT,UI_EVENT_SOURCE_KEY,event->tick,0U);
+                ui_result=app_request_ui_action(UI_ACTION_NEXT,UI_EVENT_SOURCE_KEY,0U);
                 if(ui_result!=RT_EOK)
                 {
                     rt_kprintf("[APP][KEY2][WARN] ui action failed:%d\n",ui_result);
@@ -503,7 +529,7 @@ static void app_handle_event(const app_event_t *event)
             if(event->source==APP_EVENT_SOURCE_KEY1)
             {
                 rt_kprintf("[APP][KEY1] long press -> UI BACK\n");
-                ui_result=app_request_ui_action(UI_ACTION_BACK,UI_EVENT_SOURCE_KEY,event->tick,0U);
+                ui_result=app_request_ui_action(UI_ACTION_BACK,UI_EVENT_SOURCE_KEY,0U);
                 if(ui_result!=RT_EOK)
                 {
                     rt_kprintf("[APP][KEY1][WARN] ui action failed:%d\n",ui_result);
@@ -695,6 +721,11 @@ static int app_stats(void)
     rt_uint32_t consumed;
     rt_uint32_t dropped;
 
+    rt_uint32_t post_attempt;
+    rt_uint32_t invalid;
+    rt_uint32_t max_inflight;
+    rt_uint32_t inflight;
+
     rt_base_t level;
 
     //短暂关闭中断取得快照
@@ -711,9 +742,15 @@ static int app_stats(void)
     indicator_state = g_app_indicator_state;
     ui_available=g_ui_available;
 
+    post_attempt = g_event_post_attempt_count;
+    invalid = g_event_invalid_count;
+    max_inflight = g_event_max_inflight;
+
     posted = g_event_post_count;
     consumed = g_consume_count;
     dropped = g_event_drop_count;
+
+    inflight = posted - consumed;
 
     rt_hw_interrupt_enable(level);
 
@@ -731,50 +768,498 @@ static int app_stats(void)
         (int)indicator_state);
 
     rt_kprintf(
-        "[APP][STATS] posted=%u consumed=%u dropped=%u\n",
+        "[APP][QUEUE] attempt=%u posted=%u consumed=%u "
+        "dropped=%u invalid=%u inflight=%u max_inflight=%u\n",
+        (unsigned int)post_attempt,
         (unsigned int)posted,
         (unsigned int)consumed,
-        (unsigned int)dropped);
+        (unsigned int)dropped,
+        (unsigned int)invalid,
+        (unsigned int)inflight,
+        (unsigned int)max_inflight);
 
     return 0;
 }
 
+/*
+ * 简介：输出任务11资源快照
+ *
+ * 输出：
+ * 1. RT-Thread堆当前使用量和历史峰值；
+ * 2. app/UI队列累计统计和当前inflight；
+ * 3. app/UI线程句柄和配置栈大小；
+ * 4. UI排队延迟和动作完成延迟；
+ * 5. 提醒使用list_thread读取真实栈高水位。
+ *
+ * 本函数只读取项目状态，不调用任何LVGL对象API。
+ */
+static int task11_resources(void)
+{
+    ui_runtime_stats_t ui_stats_snapshot;
+    rt_thread_t ui_thread;
+    rt_err_t result;
+    rt_base_t level;
 
-//队列满实验
+    rt_uint32_t heap_total;
+    rt_uint32_t heap_used;
+    rt_uint32_t heap_max_used;
+    rt_uint32_t heap_free;
+
+    rt_uint32_t app_posted;
+    rt_uint32_t app_consumed;
+    rt_uint32_t app_dropped;
+    rt_uint32_t app_invalid;
+    rt_uint32_t app_max_inflight;
+    rt_uint32_t app_inflight;
+
+    rt_uint32_t ui_inflight;
+    rt_uint32_t app_stack_size;
+    rt_uint32_t ui_stack_size;
+
+    /*
+     * rt_memory_info()由RT-Thread堆实现提供同步保护。
+     * max_used是启动以来历史峰值，不会在释放内存后下降。
+     */
+    rt_memory_info(
+        &heap_total,
+        &heap_used,
+        &heap_max_used);
+
+    heap_free = heap_total - heap_used;
+
+    result = ui_runtime_get_stats(&ui_stats_snapshot);
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[TASK11][RESOURCE][ERROR] "
+            "get UI stats failed: %d\n",
+            (int)result);
+
+        return (int)result;
+    }
+
+    /*
+     * 只在短临界区中复制共享计数和线程字段。
+     * 临界区内不打印、不访问LVGL。
+     */
+    level = rt_hw_interrupt_disable();
+
+    app_posted = g_event_post_count;
+    app_consumed = g_consume_count;
+    app_dropped = g_event_drop_count;
+    app_invalid = g_event_invalid_count;
+    app_max_inflight = g_event_max_inflight;
+
+    app_stack_size =
+        (g_app_thread != RT_NULL) ?
+        g_app_thread->stack_size : 0U;
+
+    ui_thread =
+        (rt_thread_t)ui_stats_snapshot.thread;
+
+    ui_stack_size =
+        (ui_thread != RT_NULL) ?
+        ui_thread->stack_size : 0U;
+
+    rt_hw_interrupt_enable(level);
+
+    app_inflight = app_posted - app_consumed;
+    ui_inflight =
+        ui_stats_snapshot.posted -
+        ui_stats_snapshot.consumed;
+
+    rt_kprintf(
+        "[TASK11][HEAP] total=%u used=%u free=%u max_used=%u\n",
+        (unsigned int)heap_total,
+        (unsigned int)heap_used,
+        (unsigned int)heap_free,
+        (unsigned int)heap_max_used);
+
+    rt_kprintf(
+        "[TASK11][APP_QUEUE] posted=%u consumed=%u "
+        "dropped=%u invalid=%u inflight=%u max_inflight=%u\n",
+        (unsigned int)app_posted,
+        (unsigned int)app_consumed,
+        (unsigned int)app_dropped,
+        (unsigned int)app_invalid,
+        (unsigned int)app_inflight,
+        (unsigned int)app_max_inflight);
+
+    rt_kprintf(
+        "[TASK11][UI_QUEUE] posted=%u consumed=%u "
+        "dropped=%u invalid=%u inflight=%u max_inflight=%u\n",
+        (unsigned int)ui_stats_snapshot.posted,
+        (unsigned int)ui_stats_snapshot.consumed,
+        (unsigned int)ui_stats_snapshot.dropped,
+        (unsigned int)ui_stats_snapshot.invalid,
+        (unsigned int)ui_inflight,
+        (unsigned int)ui_stats_snapshot.max_inflight);
+
+    rt_kprintf(
+        "[TASK11][LATENCY] tick_hz=%u "
+        "queue_last=%u queue_max=%u "
+        "complete_last=%u complete_max=%u\n",
+        (unsigned int)RT_TICK_PER_SECOND,
+        (unsigned int)ui_stats_snapshot.last_latency_ticks,
+        (unsigned int)ui_stats_snapshot.max_latency_ticks,
+        (unsigned int)
+            ui_stats_snapshot.last_complete_latency_ticks,
+        (unsigned int)
+            ui_stats_snapshot.max_complete_latency_ticks);
+
+    rt_kprintf(
+        "[TASK11][THREAD] app=%p stack=%u "
+        "ui=%p stack=%u\n",
+        g_app_thread,
+        (unsigned int)app_stack_size,
+        ui_thread,
+        (unsigned int)ui_stack_size);
+
+    /*
+     * max used需要使用RT-Thread现有高水位扫描结果。
+     * 紧接着执行list_thread，并保存app和ui两行。
+     */
+    rt_kprintf(
+        "[TASK11][THREAD] run list_thread "
+        "and record app/ui max used\n");
+
+    return 0;
+}
+/*
+ * 简介：受控验证app消息队列满路径、排空能力和压力后恢复能力
+ *
+ * 测试步骤：
+ * 1. 要求测试开始前app队列为空；
+ * 2. 锁住调度，连续发送队列深度两倍的事件；
+ * 3. 验证队列只接受APP_EVENT_QUEUE_DEPTH条，其余安全丢弃；
+ * 4. 恢复调度并有界等待成功事件全部消费；
+ * 5. 再发送一条恢复标记事件；
+ * 6. 验证恢复事件能够正常进入并被消费；
+ * 7. 最终确认队列重新回到空状态。
+ *
+ * 注意：
+ * - 测试期间不要操作实体按键；
+ * - 临界区内不打印、不延时；
+ * - 不直接修改消息队列内部字段；
+ * - 正常发送仍使用公开的app_event_post()。
+ */
 static int app_event_flood(void)
 {
     app_event_t event;
-    rt_uint32_t before_post;
-    rt_uint32_t before_drop;
-    int index;
+    rt_err_t result;
+    rt_base_t level;
+    rt_tick_t start_tick;
+    rt_tick_t timeout_ticks;
 
-    //统计队列满成功和丢弃的消息数
-    before_post = g_event_post_count;
-    before_drop = g_event_drop_count;
+    rt_uint32_t index;
+    rt_uint32_t send_success;
+    rt_uint32_t send_full;
+    rt_uint32_t send_other_fail;
 
-    event.type   = APP_EVENT_DIAG_REQUEST;
-    event.source = APP_EVENT_SOURCE_TEST;
-    event.value  = 0;
+    rt_uint32_t before_attempt;
+    rt_uint32_t before_posted;
+    rt_uint32_t before_consumed;
+    rt_uint32_t before_dropped;
+
+    rt_uint32_t after_attempt;
+    rt_uint32_t after_posted;
+    rt_uint32_t after_consumed;
+    rt_uint32_t after_dropped;
+
+    rt_uint32_t final_posted;
+    rt_uint32_t final_consumed;
+    rt_uint32_t final_dropped;
+
+    rt_bool_t drained;
+    rt_bool_t recovered;
+    rt_bool_t burst_ok;
+
+    if ((g_app_initialized != RT_TRUE) ||
+        (g_event_queue == RT_NULL) ||
+        (g_app_thread == RT_NULL))
+    {
+        rt_kprintf(
+            "[APP][STRESS][ERROR] app is not ready\n");
+
+        return -RT_EBUSY;
+    }
+
+    /* 取得测试前的一致统计快照。 */
+    level = rt_hw_interrupt_disable();
+
+    before_attempt = g_event_post_attempt_count;
+    before_posted = g_event_post_count;
+    before_consumed = g_consume_count;
+    before_dropped = g_event_drop_count;
+
+    rt_hw_interrupt_enable(level);
 
     /*
-     * 仅用于队列满测试：
-     * 暂停线程调度，使app线程不能在投递过程中消费队列。
+     * 测试前必须为空，避免正常业务事件改变
+     * “8条成功、8条丢弃”的确定性结果。
+     */
+    if (before_posted != before_consumed)
+    {
+        rt_kprintf(
+            "[APP][STRESS][ERROR] queue is not empty: "
+            "posted=%u consumed=%u inflight=%u\n",
+            (unsigned int)before_posted,
+            (unsigned int)before_consumed,
+            (unsigned int)(before_posted - before_consumed));
+
+        return -RT_EBUSY;
+    }
+
+    event.type = APP_EVENT_DIAG_REQUEST;
+    event.source = APP_EVENT_SOURCE_TEST;
+    event.tick = 0;
+    event.value = 0;
+
+    send_success = 0;
+    send_full = 0;
+    send_other_fail = 0;
+
+    /*
+     * 重要：只锁调度，不长时间关闭硬件中断。
+     * app线程暂时不能消费，因此可确定性填满队列。
      */
     rt_enter_critical();
 
-    for (index = 0; index < APP_EVENT_QUEUE_DEPTH * 2; index++)
+    for (index = 0;
+         index < APP_EVENT_STRESS_ATTEMPTS;
+         index++)
     {
-        event.tick  = rt_tick_get();
-        event.value = (rt_uint32_t)index;
-        app_event_post(&event);
+        event.tick = rt_tick_get();
+        event.value = index;
+
+        result = app_event_post(&event);
+
+        if (result == RT_EOK)
+        {
+            send_success++;
+        }
+        else if (result == -RT_EFULL)
+        {
+            send_full++;
+        }
+        else
+        {
+            send_other_fail++;
+        }
     }
 
+    /* 必须先恢复调度，再打印和等待。 */
     rt_exit_critical();
 
-    rt_kprintf("[APP][FLOOD] attempts=%u posted_delta=%u drop_delta=%u\n",
-               (unsigned int)(APP_EVENT_QUEUE_DEPTH * 2),
-               (unsigned int)(g_event_post_count - before_post),
-               (unsigned int)(g_event_drop_count - before_drop));
+    level = rt_hw_interrupt_disable();
+
+    after_attempt = g_event_post_attempt_count;
+    after_posted = g_event_post_count;
+    after_consumed = g_consume_count;
+    after_dropped = g_event_drop_count;
+
+    rt_hw_interrupt_enable(level);
+
+    rt_kprintf(
+        "[APP][STRESS] burst attempts=%u "
+        "success=%u full=%u other_fail=%u\n",
+        (unsigned int)APP_EVENT_STRESS_ATTEMPTS,
+        (unsigned int)send_success,
+        (unsigned int)send_full,
+        (unsigned int)send_other_fail);
+
+    rt_kprintf(
+        "[APP][STRESS] counter delta: "
+        "attempt=%u posted=%u dropped=%u\n",
+        (unsigned int)(after_attempt - before_attempt),
+        (unsigned int)(after_posted - before_posted),
+        (unsigned int)(after_dropped - before_dropped));
+
+    burst_ok = RT_TRUE;
+
+    if ((after_attempt - before_attempt) !=
+        APP_EVENT_STRESS_ATTEMPTS)
+    {
+        burst_ok = RT_FALSE;
+    }
+
+    if (send_success != APP_EVENT_QUEUE_DEPTH)
+    {
+        burst_ok = RT_FALSE;
+    }
+
+    if (send_full !=
+        (APP_EVENT_STRESS_ATTEMPTS -
+         APP_EVENT_QUEUE_DEPTH))
+    {
+        burst_ok = RT_FALSE;
+    }
+
+    if (send_other_fail != 0U)
+    {
+        burst_ok = RT_FALSE;
+    }
+
+    if ((after_posted - before_posted) != send_success)
+    {
+        burst_ok = RT_FALSE;
+    }
+
+    if ((after_dropped - before_dropped) != send_full)
+    {
+        burst_ok = RT_FALSE;
+    }
+
+    timeout_ticks =
+        rt_tick_from_millisecond(
+            APP_EVENT_STRESS_TIMEOUT_MS);
+
+    if (timeout_ticks == 0)
+    {
+        timeout_ticks = 1;
+    }
+
+    /*
+     * 等待本轮成功投递的事件全部消费。
+     * Shell线程可以等待，但正常app_event_post()仍然不阻塞。
+     */
+    start_tick = rt_tick_get();
+    drained = RT_FALSE;
+
+    while ((rt_tick_get() - start_tick) < timeout_ticks)
+    {
+        level = rt_hw_interrupt_disable();
+
+        after_posted = g_event_post_count;
+        after_consumed = g_consume_count;
+
+        rt_hw_interrupt_enable(level);
+
+        if (after_consumed >=
+            (before_consumed + send_success))
+        {
+            drained = RT_TRUE;
+            break;
+        }
+
+        rt_thread_mdelay(APP_EVENT_STRESS_POLL_MS);
+    }
+
+    if (drained != RT_TRUE)
+    {
+        rt_kprintf(
+            "[APP][STRESS][ERROR] drain timeout: "
+            "expected=%u consumed_delta=%u\n",
+            (unsigned int)send_success,
+            (unsigned int)(
+                after_consumed - before_consumed));
+
+        return -RT_ETIMEOUT;
+    }
+
+    if (after_posted != after_consumed)
+    {
+        rt_kprintf(
+            "[APP][STRESS][ERROR] queue did not return empty: "
+            "posted=%u consumed=%u\n",
+            (unsigned int)after_posted,
+            (unsigned int)after_consumed);
+
+        burst_ok = RT_FALSE;
+    }
+
+    rt_kprintf(
+        "[APP][STRESS] drain complete: "
+        "posted_delta=%u consumed_delta=%u\n",
+        (unsigned int)(after_posted - before_posted),
+        (unsigned int)(after_consumed - before_consumed));
+
+    /*
+     * 压力结束后发送单独的恢复事件。
+     * 特殊value用于在UART日志中识别本条消息。
+     */
+    event.type = APP_EVENT_DIAG_REQUEST;
+    event.source = APP_EVENT_SOURCE_TEST;
+    event.tick = rt_tick_get();
+    event.value = APP_EVENT_RECOVERY_VALUE;
+
+    result = app_event_post(&event);
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[APP][STRESS][ERROR] recovery post failed: %d\n",
+            (int)result);
+
+        return (int)result;
+    }
+
+    start_tick = rt_tick_get();
+    recovered = RT_FALSE;
+
+    while ((rt_tick_get() - start_tick) < timeout_ticks)
+    {
+        level = rt_hw_interrupt_disable();
+
+        final_posted = g_event_post_count;
+        final_consumed = g_consume_count;
+        final_dropped = g_event_drop_count;
+
+        rt_hw_interrupt_enable(level);
+
+        if (final_consumed > after_consumed)
+        {
+            recovered = RT_TRUE;
+            break;
+        }
+
+        rt_thread_mdelay(APP_EVENT_STRESS_POLL_MS);
+    }
+
+    if (recovered != RT_TRUE)
+    {
+        rt_kprintf(
+            "[APP][STRESS][ERROR] "
+            "recovery event consume timeout\n");
+
+        return -RT_ETIMEOUT;
+    }
+
+    rt_kprintf(
+        "[APP][STRESS] recovery posted=%u consumed=%u "
+        "dropped=%u\n",
+        (unsigned int)(final_posted - after_posted),
+        (unsigned int)(final_consumed - after_consumed),
+        (unsigned int)(final_dropped - after_dropped));
+
+    if (((final_posted - after_posted) != 1U) ||
+        ((final_consumed - after_consumed) != 1U) ||
+        (final_dropped != after_dropped) ||
+        (final_posted != final_consumed))
+    {
+        rt_kprintf(
+            "[APP][STRESS][ERROR] "
+            "recovery counters do not match\n");
+
+        return -RT_ERROR;
+    }
+
+    if (burst_ok != RT_TRUE)
+    {
+        rt_kprintf(
+            "[APP][STRESS][FAIL] "
+            "burst result does not match "
+            "depth=%u attempts=%u\n",
+            (unsigned int)APP_EVENT_QUEUE_DEPTH,
+            (unsigned int)APP_EVENT_STRESS_ATTEMPTS);
+
+        return -RT_ERROR;
+    }
+
+    rt_kprintf(
+        "[APP][STRESS][PASS] "
+        "success=%u dropped=%u recovery=ok\n",
+        (unsigned int)send_success,
+        (unsigned int)send_full);
 
     return 0;
 }
@@ -797,40 +1282,99 @@ static rt_err_t indicator_selftest(void)
  * 输入：
  *     action：UI动作类型
  *     source：UI事件的抽象来源
- *     tick：原始应用事件的发生tick
  *     value：动作需要的值类型载荷
  * 返回值：
  *     RT_EOK：事件成功进入UI队列
  *     其他：ui_event_post()返回的真实错误码
  */
-static rt_err_t app_request_ui_action(ui_action_t action,ui_event_source_t source,rt_tick_t tick,rt_uint32_t value)
+static rt_err_t app_request_ui_action(ui_action_t action,ui_event_source_t source,rt_uint32_t value)
 {
     ui_event_t event =
     {
         .type = action,
         .source = source,
-        .tick = tick,
+
+        /*
+         * 重要：任务11测量的是统一语义进入UI路径，
+         * 到项目页面状态处理完成的时间。
+         * 原始GPIO事件tick仍保留在app事件日志中。
+         */
+        .tick = rt_tick_get(),
+
         .value = value
     };
 
-    /*
-     * rt_mq_send()会复制整个ui_event_t，
-     * 不会保存该局部变量的地址。
-     */
     return ui_event_post(&event);
 }
-#ifdef RT_USING_FINSH
 
+/*
+ * 重要：以下函数只保护统计字段。
+ * 临界区内不得调用消息队列、日志或任何可能阻塞的接口。
+ */
+static void app_record_post_attempt(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
 
-#endif
+    g_event_post_attempt_count++;
+
+    rt_hw_interrupt_enable(level);
+}
+
+static void app_record_invalid(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    g_event_invalid_count++;
+
+    rt_hw_interrupt_enable(level);
+}
+
+static void app_record_post_drop(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    g_event_drop_count++;
+
+    rt_hw_interrupt_enable(level);
+}
+
+static void app_record_post_success(void)
+{
+    rt_uint32_t inflight;
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    g_event_post_count++;
+
+    /*
+     * max_inflight是“尚未完成处理的事件数”高水位，
+     * 不是直接读取RT-Thread消息队列内部entry字段。
+     */
+    inflight = g_event_post_count - g_consume_count;
+    if (inflight > g_event_max_inflight)
+    {
+        g_event_max_inflight = inflight;
+    }
+
+    rt_hw_interrupt_enable(level);
+}
+
+static void app_record_consumed(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    g_consume_count++;
+
+    rt_hw_interrupt_enable(level);
+}
 
 #ifdef RT_USING_FINSH
 MSH_CMD_EXPORT(app_stats,
-               show application event queue statistics);
-
+                show application event queue statistics);
+MSH_CMD_EXPORT(task11_resources,
+                show task11 heap queue latency and thread baseline);
 MSH_CMD_EXPORT(app_event_flood,
-               inject events to verify queue full handling);
+                inject events to verify queue full handling);
 MSH_CMD_EXPORT(indicator_selftest,
-               Perform RGB short-term self-test);
+                Perform RGB short-term self-test);
 
 #endif

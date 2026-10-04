@@ -21,7 +21,11 @@ typedef struct
     lv_obj_t *system_info_title;
     lv_obj_t *system_info_text;
 
+    ui_page_action_handler_t action_handler;
+    void *action_user_data;
+
     ui_page_stats_t stats;
+
 } ui_page_context_t;
 static ui_page_context_t g_ui_page_context =
 {
@@ -32,16 +36,23 @@ static ui_page_context_t g_ui_page_context =
     }
 };
 
+static const ui_action_t g_ui_nav_home = UI_ACTION_HOME;
+static const ui_action_t g_ui_nav_back = UI_ACTION_BACK;
+static const ui_action_t g_ui_nav_next = UI_ACTION_NEXT;
+
 //公开函数声明
 rt_err_t ui_page_create(void);                              //创建ui界面
 rt_err_t ui_page_handle_event(const ui_event_t *event);     //ui事件处理函数
 rt_err_t ui_page_get_stats(ui_page_stats_t *stats);         //获取ui页面统计信息
-
+rt_err_t ui_page_register_action_handler(ui_page_action_handler_t handler,void *user_data); //注册页面动作处理函数
 //私有函数声明
 
 static rt_err_t ui_page_create_watchface(lv_obj_t *parent);         //创建表盘页面
 static rt_err_t ui_page_create_menu(lv_obj_t *parent);              //创建菜单页面
 static rt_err_t ui_page_create_system_info(lv_obj_t *parent);       //创建系统信息页面
+
+static lv_obj_t *ui_page_create_nav_button(lv_obj_t *parent,const char *text,
+    lv_align_t align,lv_coord_t x_offset,const ui_action_t *action);//创建最小导航按钮
 
 static rt_err_t ui_page_apply_visibility(ui_page_id_t target);      //ui界面可见性函数
 static rt_err_t ui_page_show(ui_page_id_t target);                  //切换到指定页面
@@ -49,6 +60,11 @@ static rt_err_t ui_page_show(ui_page_id_t target);                  //切换到�
 static rt_bool_t ui_page_id_is_valid(ui_page_id_t page);            //检查页面id是否有效
 static ui_page_id_t ui_page_next_id(ui_page_id_t current);          //获取下一个页面ID
 static ui_page_id_t ui_page_back_id(ui_page_id_t current);          //获取返回页面ID
+
+
+
+static void ui_page_nav_event_cb(lv_event_t *event);                //LVGL点击回调
+
 
 static void ui_page_cleanup(void);                                  //ui界面统一清理函数
 
@@ -297,6 +313,47 @@ rt_err_t ui_page_get_stats(ui_page_stats_t *stats)
 
     return RT_EOK;
 }
+
+
+/*
+ * 简介：注册页面动作处理函数
+ * 输入：
+ *     handler：页面动作处理函数
+ *     user_data：传递给动作处理函数的用户数据
+ * 返回值：
+ *     RT_EOK：注册成功
+ *     -RT_EINVAL：handler为空
+ *     -RT_EBUSY：页面已经创建，不允许替换回调
+ */
+rt_err_t ui_page_register_action_handler(
+    ui_page_action_handler_t handler,
+    void *user_data)
+{
+    rt_base_t level;
+
+    if (handler == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    /*
+     * 页面已经创建后不允许替换回调，
+     * 防止LVGL对象运行期间改变行为所有者。
+     */
+    if (g_ui_page_context.stats.created == RT_TRUE)
+    {
+        return -RT_EBUSY;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    g_ui_page_context.action_handler = handler;
+    g_ui_page_context.action_user_data = user_data;
+
+    rt_hw_interrupt_enable(level);
+
+    return RT_EOK;
+}
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 
 
@@ -322,6 +379,7 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     lv_obj_t *title;
     lv_obj_t *time_label;
     lv_obj_t *status_label;
+    lv_obj_t *nav_button;
 
     /* 父对象必须是已经创建成功的根screen。 */
     if (parent == RT_NULL)
@@ -345,7 +403,7 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     title = RT_NULL;
     time_label = RT_NULL;
     status_label = RT_NULL;
-
+    nav_button = RT_NULL;
     /*
      * 1. 创建表盘页面容器。
      * 三个页面都应是root screen下相互独立的container。
@@ -463,8 +521,26 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
         LV_ALIGN_CENTER,
         0,
         58);
+
     /*
-     * 8. 全部对象创建成功后再写入全局上下文。
+    * 8. 创建表盘页NEXT按钮。
+    *
+    * 点击回调只上报UI_ACTION_NEXT，
+    * 不允许在LVGL回调中直接调用ui_page_show()。
+    */
+    nav_button = ui_page_create_nav_button(
+        page,
+        "NEXT",
+        LV_ALIGN_BOTTOM_RIGHT,
+        -18,
+        &g_ui_nav_next);
+
+    if (nav_button == RT_NULL)
+    {
+        goto create_failed;
+    }
+    /*
+     * 9. 全部对象创建成功后再写入全局上下文。
      * 这样其他函数不会观察到一个只创建了一半的页面。
      */
     g_ui_page_context.watchface_page = page;
@@ -510,16 +586,16 @@ create_failed:
  *     -RT_ENOMEM：LVGL对象创建失败
  *
  * 说明：
- * 1. 本函数只能由UI线程调用；
- * 2. 菜单内容当前只是静态文字；
- * 3. 不创建按钮、点击回调、动画或真实应用入口；
- * 4. 全部创建成功后才把对象句柄写入全局上下文。
+ * 1. 菜单内容仍为静态展示，不执行真实应用业务；
+ * 2. 只创建任务11要求的HOME、BACK和NEXT导航按钮；
+ * 3. 不加入动画、图片或完整应用入口。
  */
 static rt_err_t ui_page_create_menu(lv_obj_t *parent)
 {
     lv_obj_t *page;
     lv_obj_t *title;
     lv_obj_t *items;
+    lv_obj_t *nav_button;
 
     /* 父对象必须是有效的根screen。 */
     if (parent == RT_NULL)
@@ -541,7 +617,7 @@ static rt_err_t ui_page_create_menu(lv_obj_t *parent)
     page = RT_NULL;
     title = RT_NULL;
     items = RT_NULL;
-
+    nav_button = RT_NULL;
     /*
      * 1. 创建菜单页面container。
      * 该container与表盘页、系统信息页同为root screen的直接子对象。
@@ -668,8 +744,54 @@ static rt_err_t ui_page_create_menu(lv_obj_t *parent)
         LV_ALIGN_CENTER,
         0,
         20);
+
     /*
-     * 7. 全部创建成功后再提交到全局上下文。
+    * 7. 创建菜单页HOME按钮。
+    * HOME固定在左侧，保持三个页面的触摸位置一致。
+    */
+    nav_button = ui_page_create_nav_button(
+        page,
+        "HOME",
+        LV_ALIGN_BOTTOM_LEFT,
+        18,
+        &g_ui_nav_home);
+
+    if (nav_button == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    /*
+    * 8. 创建菜单页BACK按钮。
+    */
+    nav_button = ui_page_create_nav_button(
+        page,
+        "BACK",
+        LV_ALIGN_BOTTOM_MID,
+        0,
+        &g_ui_nav_back);
+
+    if (nav_button == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    /*
+    * 9. 创建菜单页NEXT按钮。
+    */
+    nav_button = ui_page_create_nav_button(
+        page,
+        "NEXT",
+        LV_ALIGN_BOTTOM_RIGHT,
+        -18,
+        &g_ui_nav_next);
+
+    if (nav_button == RT_NULL)
+    {
+        goto create_failed;
+    }
+    /*
+     * 10. 全部创建成功后再提交到全局上下文。
      * 避免其他函数看到只创建了一部分的菜单页面。
      */
     g_ui_page_context.menu_page = page;
@@ -723,6 +845,7 @@ static rt_err_t ui_page_create_system_info(lv_obj_t *parent)
     lv_obj_t *page;
     lv_obj_t *title;
     lv_obj_t *info_text;
+    lv_obj_t *nav_button;
 
     /* 父对象必须是有效的根screen。 */
     if (parent == RT_NULL)
@@ -767,7 +890,7 @@ static rt_err_t ui_page_create_system_info(lv_obj_t *parent)
     page = RT_NULL;
     title = RT_NULL;
     info_text = RT_NULL;
-
+    nav_button = RT_NULL;
     /*
      * 3. 创建系统信息页container。
      */
@@ -908,8 +1031,41 @@ static rt_err_t ui_page_create_system_info(lv_obj_t *parent)
         LV_ALIGN_TOP_MID,
         0,
         88);
+
     /*
-     * 9. 全部对象创建成功后再提交到全局上下文，
+    * 9. 创建系统信息页HOME按钮。
+    */
+    nav_button = ui_page_create_nav_button(
+        page,
+        "HOME",
+        LV_ALIGN_BOTTOM_LEFT,
+        18,
+        &g_ui_nav_home);
+
+    if (nav_button == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    /*
+    * 10. 创建系统信息页BACK按钮。
+    *
+    * BACK始终位于底部中间，
+    * 避免相同语义在不同页面出现位置变化。
+    */
+    nav_button = ui_page_create_nav_button(
+        page,
+        "BACK",
+        LV_ALIGN_BOTTOM_MID,
+        0,
+        &g_ui_nav_back);
+
+    if (nav_button == RT_NULL)
+    {
+        goto create_failed;
+    }
+    /*
+     * 11. 全部对象创建成功后再提交到全局上下文，
      * 避免其他函数看到创建了一半的页面。
      */
     g_ui_page_context.system_info_page = page;
@@ -934,6 +1090,66 @@ create_failed:
     g_ui_page_context.system_info_text = RT_NULL;
 
     return -RT_ENOMEM;
+}
+/*简介：创建最小导航按钮
+  输入: parent: 父对象
+        text: 按钮文本
+        align: 对齐方式
+        x_offset: X方向偏移量
+        action: 点击动作回调
+  返回值：lv_obj_t * 创建的导航按钮对象，若创建失败则返回RT_NULL。
+*/
+static lv_obj_t *ui_page_create_nav_button(
+    lv_obj_t *parent,
+    const char *text,
+    lv_align_t align,
+    lv_coord_t x_offset,
+    const ui_action_t *action)
+{
+    lv_obj_t *button;
+    lv_obj_t *label;
+
+    if ((parent == RT_NULL) ||(text == RT_NULL) ||(action == RT_NULL))
+    {
+        return RT_NULL;
+    }
+
+    button = lv_btn_create(parent);
+    if (button == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    lv_obj_set_size(button, 96, 44);
+    lv_obj_align(button, align, x_offset, -12);
+
+    lv_obj_add_event_cb(
+        button,
+        ui_page_nav_event_cb,
+        LV_EVENT_CLICKED,
+        (void *)action);
+
+    label = lv_label_create(button);
+    if (label == RT_NULL)
+    {
+        lv_obj_del(button);
+        return RT_NULL;
+    }
+
+    lv_label_set_text(label, text);
+
+    /*
+     * 继续使用已经通过任务7验证的SiFli字体入口，
+     * 避免恢复直接LVGL字体导致的对齐问题。
+     */
+    lv_ext_set_local_font(
+        label,
+        FONT_NORMAL,
+        LV_COLOR_WHITE);
+
+    lv_obj_center(label);
+
+    return button;
 }
 
 /*简介：ui界面统一清理函数
@@ -1238,6 +1454,72 @@ static ui_page_id_t ui_page_back_id(ui_page_id_t current)
         return UI_PAGE_COUNT;
     }
 
+}
+
+/*简介：LVGL点击回调
+  输入: event: LVGL事件对象
+  返回值：void: 无
+
+*/
+static void ui_page_nav_event_cb(lv_event_t *event)
+{
+    const ui_action_t *action;
+    rt_err_t result;
+
+    if (event == RT_NULL)
+    {
+        return;
+    }
+
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+
+    action = (const ui_action_t *)lv_event_get_user_data(event);
+    if ((action == RT_NULL) ||
+        (*action <= UI_ACTION_NONE) ||
+        (*action >= UI_ACTION_COUNT))
+    {
+        ui_page_stat_increment(
+            &g_ui_page_context.stats.touch_action_fail);
+        return;
+    }
+
+    ui_page_stat_increment(
+        &g_ui_page_context.stats.touch_action_attempt);
+
+    if (g_ui_page_context.action_handler == RT_NULL)
+    {
+        ui_page_stat_increment(
+            &g_ui_page_context.stats.touch_action_fail);
+        return;
+    }
+
+    /*
+     * 重要：这里不能直接调用ui_page_show()。
+     * 触摸和按键必须进入同一个UI事件队列。
+     */
+    result = g_ui_page_context.action_handler(
+        *action,
+        rt_tick_get(),
+        g_ui_page_context.action_user_data);
+
+    if (result == RT_EOK)
+    {
+        ui_page_stat_increment(
+            &g_ui_page_context.stats.touch_action_success);
+    }
+    else
+    {
+        ui_page_stat_increment(
+            &g_ui_page_context.stats.touch_action_fail);
+
+        rt_kprintf(
+            "[UI][TOUCH_NAV][WARN] action=%d post failed: %d\n",
+            (int)*action,
+            (int)result);
+    }
 }
 
 /*简介：检查页面id是否有效

@@ -89,10 +89,18 @@ static void ui_runtime_thread_fail(ui_failure_stage_t stage,rt_err_t error);    
 static int ui_stats(void);                                                                          //shell函数声明
 
 static rt_err_t ui_runtime_handle_event(const ui_event_t *event);                                   //ui事件处理函数
-static void ui_runtime_update_event_stats(rt_tick_t latency_ticks,rt_bool_t event_valid,rt_err_t handle_result);    //更新事件统计
+static void ui_runtime_update_event_stats(
+    const ui_event_t *event,
+    rt_tick_t queue_latency_ticks,
+    rt_tick_t complete_latency_ticks,
+    rt_bool_t event_valid,
+    rt_err_t handle_result);                                                                        //更新事件统计
+static rt_err_t ui_runtime_page_action_handler(ui_action_t action,rt_tick_t request_tick,void *user_data);//页面动作回调函数
 static void ui_runtime_stat_increment(rt_uint32_t *counter);                                        //线程安全地增加一个32位统计计数
 static rt_bool_t ui_event_is_valid(const ui_event_t *event);                                        //ui事件合法性判断
 static void ui_runtime_release_event_queue(void);                                                   //队列清理函数
+static void ui_runtime_record_post_success(const ui_event_t *event);                                //记录一次成功投递的UI事件，并更新最大未完成事件数
+
 #ifdef RT_USING_FINSH
 static int ui_event_stress(void);                                                                   //ui事件压力测试
 #endif
@@ -271,7 +279,7 @@ rt_err_t ui_event_post(const ui_event_t *event)
         return result;
     }
 
-    ui_runtime_stat_increment(&g_ui_runtime_context.stats.posted);
+    ui_runtime_record_post_success(event);
 
     return RT_EOK;
 
@@ -412,6 +420,19 @@ static void ui_thread_entry(void *parameter)
          * 注意不要把阶段统一覆盖成DRAW_BUFFER。
          */
         ui_runtime_thread_fail(g_ui_runtime_context.stats.failure_stage,g_ui_runtime_context.stats.last_error);
+        return;
+    }
+
+    // 注册页面动作回调函数
+    result = ui_page_register_action_handler(
+        ui_runtime_page_action_handler,
+        RT_NULL);
+
+    if (result != RT_EOK)
+    {
+        ui_runtime_thread_fail(
+            UI_FAILURE_HANDLER_REGISTER,
+            result);
         return;
     }
 
@@ -604,7 +625,10 @@ static void ui_thread_entry(void *parameter)
 static rt_err_t ui_runtime_handle_event(const ui_event_t *event)
 {
 
-    rt_tick_t latency_ticks;
+    rt_tick_t dequeue_tick;
+    rt_tick_t complete_tick;
+    rt_tick_t queue_latency_ticks;
+    rt_tick_t complete_latency_ticks;
     rt_bool_t event_valid;
     rt_err_t handle_result;
 
@@ -626,7 +650,8 @@ static rt_err_t ui_runtime_handle_event(const ui_event_t *event)
      * 在事件延迟未超过tick计数周期的前提下，
      * 可以自然处理rt_tick_t回绕。
      */
-    latency_ticks = rt_tick_get() - event->tick;
+    dequeue_tick = rt_tick_get();
+    queue_latency_ticks = dequeue_tick - event->tick;
 
     /* 消费端再次进行防御性合法性检查。 */
     event_valid = ui_event_is_valid(event);
@@ -673,14 +698,36 @@ static rt_err_t ui_runtime_handle_event(const ui_event_t *event)
     }
 
     /*
-     * 对本次已出队事件进行一次性统计，
-     * 防止consumed、latency和handled出现分散更新。
+     * 重要：页面处理函数返回后，页面可见性和current_page
+     * 才已经完成项目侧状态提交。
+     *
+     * 这不是AMOLED物理扫描完成时间。
      */
+    complete_tick = rt_tick_get();
+    complete_latency_ticks = complete_tick - event->tick;
+
     ui_runtime_update_event_stats(
-        latency_ticks,
+        event,
+        queue_latency_ticks,
+        complete_latency_ticks,
         event_valid,
         handle_result);
 
+    /*
+     * TEST来源可能由压力测试大量产生，避免日志过密。
+     */
+    if ((event_valid == RT_TRUE) &&
+        (event->source != UI_EVENT_SOURCE_TEST))
+    {
+        rt_kprintf(
+            "[UI][INPUT] source=%d action=%d "
+            "queue_ticks=%u complete_ticks=%u result=%d\n",
+            (int)event->source,
+            (int)event->type,
+            (unsigned int)queue_latency_ticks,
+            (unsigned int)complete_latency_ticks,
+            (int)handle_result);
+    }
     return handle_result;
 
 }
@@ -700,7 +747,9 @@ static rt_err_t ui_runtime_handle_event(const ui_event_t *event)
  * 4. 所有关联字段在同一个短临界区中更新，避免查询到半更新状态。
  */
 static void ui_runtime_update_event_stats(
-    rt_tick_t latency_ticks,
+    const ui_event_t *event,
+    rt_tick_t queue_latency_ticks,
+    rt_tick_t complete_latency_ticks,
     rt_bool_t event_valid,
     rt_err_t handle_result)
 {
@@ -742,22 +791,36 @@ static void ui_runtime_update_event_stats(
     g_ui_runtime_context.stats.consumed++;
 
     /* 保存最近一次事件的排队延迟。 */
-    g_ui_runtime_context.stats.last_latency_ticks =
-        latency_ticks;
+    g_ui_runtime_context.stats.last_latency_ticks =queue_latency_ticks;
 
     /* 更新启动以来观测到的最大排队延迟。 */
-    if (latency_ticks >
+    if (queue_latency_ticks >
         g_ui_runtime_context.stats.max_latency_ticks)
     {
         g_ui_runtime_context.stats.max_latency_ticks =
-            latency_ticks;
+            queue_latency_ticks;
     }
 
+    if (event_valid == RT_TRUE)
+    {
+        g_ui_runtime_context.stats.last_action = event->type;
+        g_ui_runtime_context.stats.last_source = event->source;
+
+        g_ui_runtime_context.stats.last_complete_latency_ticks =
+            complete_latency_ticks;
+
+        if (complete_latency_ticks >
+            g_ui_runtime_context.stats.max_complete_latency_ticks)
+        {
+            g_ui_runtime_context.stats.max_complete_latency_ticks =
+                complete_latency_ticks;
+        }
+    }
     /*
      * 超过约定的100 ms阈值时增加late。
      * 事件超时只用于诊断，不表示必须丢弃该事件。
      */
-    if (latency_ticks > late_threshold_ticks)
+    if (queue_latency_ticks > late_threshold_ticks)
     {
         g_ui_runtime_context.stats.late++;
     }
@@ -782,6 +845,40 @@ static void ui_runtime_update_event_stats(
     }
 
     rt_hw_interrupt_enable(level);
+}
+
+
+/* 简介：页面动作回调函数，将用户动作转换为UI事件并投递到事件队列。
+ * 输入：action：用户动作
+ *        request_tick：请求时间戳
+ *        user_data：用户数据
+ * 返回值：无
+ */
+static rt_err_t ui_runtime_page_action_handler(
+    ui_action_t action,
+    rt_tick_t request_tick,
+    void *user_data)
+{
+    ui_event_t event;
+
+    (void)user_data;
+
+    if ((action <= UI_ACTION_NONE) ||
+        (action >= UI_ACTION_COUNT))
+    {
+        return -RT_EINVAL;
+    }
+
+    event.type = action;
+    event.source = UI_EVENT_SOURCE_TOUCH;
+    event.tick = request_tick;
+    event.value = 0U;
+
+    /*
+     * 即使当前调用者就是UI线程，也只进行非阻塞投递。
+     * 页面切换将在当前LVGL回调返回后由UI消费点执行。
+     */
+    return ui_event_post(&event);
 }
 
 /* 简介：线程安全地增加一个32位统计计数
@@ -1194,6 +1291,41 @@ static void ui_runtime_release_event_queue(void)
         (void)rt_mq_delete(queue);
     }
 
+}
+
+ /* 简介：记录一次成功投递的UI事件，并更新最大未完成事件数。
+  输入：event：成功投递的UI事件
+  返回值：无
+*/
+static void ui_runtime_record_post_success(const ui_event_t *event)
+{
+    rt_uint32_t inflight;
+    rt_base_t level;
+
+    if (event == RT_NULL)
+    {
+        return;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    g_ui_runtime_context.stats.posted++;
+
+    /*
+     * consumed在事件处理完成后增加，因此inflight包含：
+     * 1. 仍在队列中的事件；
+     * 2. 已经出队但尚未完成处理的一条事件。
+     */
+    inflight =
+        g_ui_runtime_context.stats.posted -
+        g_ui_runtime_context.stats.consumed;
+
+    if (inflight > g_ui_runtime_context.stats.max_inflight)
+    {
+        g_ui_runtime_context.stats.max_inflight = inflight;
+    }
+
+    rt_hw_interrupt_enable(level);
 }
 
 #ifdef RT_USING_FINSH
@@ -1623,6 +1755,8 @@ static int ui_stats(void)
     ui_page_stats_t ui_page_stats;
     rt_err_t result;
 
+    rt_uint32_t inflight;
+
     result = ui_runtime_get_stats(&stats);
     if (result != RT_EOK)
     {
@@ -1632,6 +1766,7 @@ static int ui_stats(void)
         return (int)result;
     }
 
+    inflight = stats.posted - stats.consumed;
     rt_kprintf(
         "[UI][STATS] state=%d thread=%p ready_tick=%u\n",
         (int)stats.state,
@@ -1741,6 +1876,25 @@ static int ui_stats(void)
                (unsigned int)ui_page_stats.switch_fail,
                (unsigned int)ui_page_stats.switch_noop);
 
+    rt_kprintf(
+                "[UI][QUEUE] posted=%u consumed=%u dropped=%u "
+                "inflight=%u max_inflight=%u\n",
+                (unsigned int)stats.posted,
+                (unsigned int)stats.consumed,
+                (unsigned int)stats.dropped,
+                (unsigned int)inflight,
+                (unsigned int)stats.max_inflight);
+
+    rt_kprintf(
+                "[UI][LATENCY] source=%d action=%d "
+                "queue_last=%u queue_max=%u "
+                "complete_last=%u complete_max=%u\n",
+                (int)stats.last_source,
+                (int)stats.last_action,
+                (unsigned int)stats.last_latency_ticks,
+                (unsigned int)stats.max_latency_ticks,
+                (unsigned int)stats.last_complete_latency_ticks,
+                (unsigned int)stats.max_complete_latency_ticks);
 
 
     return 0;
