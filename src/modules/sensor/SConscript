@@ -1,0 +1,19 @@
+import os
+from building import *
+
+cwd = GetCurrentDir()
+src = Glob('*.c')
+
+inc = [
+    cwd,
+    os.path.abspath(os.path.join(cwd, '..', '..', 'hal_port')),
+]
+
+group = DefineGroup(
+    'sensor_module',
+    src,
+    depend=['BSP_USING_I2C3'],
+    CPPPATH=inc
+)
+
+Return('group')
