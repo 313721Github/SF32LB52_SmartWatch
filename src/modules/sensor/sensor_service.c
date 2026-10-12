@@ -7,6 +7,8 @@
 #ifdef RT_USING_FINSH
 #include "finsh.h"
 #include <string.h>
+#include <errno.h>
+#include <stdlib.h>
 
 //私有函数
 static rt_err_t task4_probe_lsm(rt_uint8_t *active_address);            //探测LSM6DS3TR-C传感器并返回其I2C地址
@@ -15,7 +17,12 @@ static rt_err_t task4_probe_ltr303(void);                               //探测
 static rt_err_t task4_probe_all(rt_uint8_t *lsm_address);               //探测所有传感器并返回LSM6DS3TR-C的I2C地址
 static rt_err_t task4_failure_recovery_test(rt_uint8_t active_address); //探测LSM6DS3TR-C传感器并进行故障恢复测试
 static int sensor_id_test(int argc, char **argv);                       //通过FINSH命令行探测所有传感器并返回LSM6DS3TR-C的I2C地址
+static rt_err_t task5_parse_uint_arg(const char *text,
+                                     rt_uint32_t minimum,
+                                     rt_uint32_t maximum,
+                                     rt_uint32_t *value);               //解析FINSH命令行参数为无符号整数
 
+static int imu_sample_test(int argc, char **argv);                      //通过FINSH命令行读取LSM6DS3TR-C的陀螺仪和加速度计采样数据
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 /*简介：读取实板LSM6DS3TR-C身份并输出已确认的I2C地址
   输入：active_address: 输出已确认的LSM6DS3TR-C有效7位I2C地址
@@ -310,6 +317,285 @@ static int sensor_id_test(int argc, char **argv)
     return (int)result;
 }
 
+/*
+ * 简介：把Shell参数解析为指定范围内的无符号整数。
+ * 输入：text为以'\0'结束的参数字符串，不允许为RT_NULL；
+ *       minimum和maximum为闭区间边界；
+ *       value为调用者拥有的输出缓冲区，不允许为RT_NULL。
+ * 返回值：解析成功返回RT_EOK；参数为空、含非法字符或越界返回-RT_EINVAL。
+ * 说明：只解析参数，不访问传感器、共享状态或UI对象。
+ */
+static rt_err_t task5_parse_uint_arg(const char *text,
+                                     rt_uint32_t minimum,
+                                     rt_uint32_t maximum,
+                                     rt_uint32_t *value)
+{
+    char *end;
+    unsigned long parsed;
+
+    if ((text == RT_NULL) || (value == RT_NULL)|| (minimum > maximum))
+    {
+        return -RT_EINVAL;
+    }
+
+    end = RT_NULL;
+    errno = 0;
+    /*
+     * strtoul允许空白和正负号，这里要求Shell参数必须直接以数字开头。
+     */
+    if ((*text < '0') || (*text > '9'))
+    {
+        return -RT_EINVAL;
+    }
+    errno = 0;      //清除errno，确保后续检查的准确性
+    parsed = strtoul(text, &end, 10);//以10进制解析字符串为无符号长整数
+
+    if ((errno == ERANGE) ||
+        (end == RT_NULL) ||
+        (end == text) ||
+        (*end != '\0') ||
+        (parsed < (unsigned long)minimum) ||
+        (parsed > (unsigned long)maximum))
+    {
+        return -RT_EINVAL;
+    }
+
+    /* 所有检查通过后才更新调用者的输出。 */
+    *value = (rt_uint32_t)parsed;
+
+    return RT_EOK;
+}
+
+/*
+ * 简介：初始化IMU并按指定次数和周期采集、输出六轴样本和间隔统计。
+ * 输入：argc和argv来自FinSH线程；
+ *       可用格式为imu_sample_test [count] [period_ms]。
+ * 返回值：测试完成返回RT_EOK；参数、初始化或采样错误返回相应错误。
+ * 说明：运行在FinSH线程；执行期间由本命令独占任务5的传感器I2C访问，
+ *       不创建后台线程，不修改UI对象。
+ */
+static int imu_sample_test(int argc, char **argv)
+{
+    lsm6ds3tr_c_config_readback_t config = {0};
+    sensor_imu_sample_t sample = {0};
+
+    rt_uint32_t count = 10U;
+    rt_uint32_t period_ms = 20U;
+    rt_uint32_t index;
+    rt_tick_t iteration_start_tick;
+    rt_tick_t current_tick;
+    rt_tick_t elapsed_tick;
+    rt_tick_t period_tick;
+
+    rt_uint32_t attempt_count = 0U;
+    rt_uint32_t success_count = 0U;
+    rt_uint32_t not_ready_count = 0U;
+    rt_uint32_t failure_count = 0U;
+
+    rt_bool_t have_previous_tick = RT_FALSE;        //标记是否有上一个样本的时间戳
+    rt_bool_t have_delta = RT_FALSE;                //标记是否有有效的时间间隔数据
+
+    rt_tick_t previous_tick = 0U;
+    rt_tick_t delta;
+    rt_tick_t minimum_delta = 0U;
+    rt_tick_t maximum_delta = 0U;
+
+    rt_uint64_t delta_sum = 0U;
+    rt_uint32_t delta_count = 0U;
+
+    rt_err_t result;
+
+    if (argc > 3)
+    {
+        rt_kprintf("usage: imu_sample_test [count] [period_ms]\n");
+        return -RT_EINVAL;
+    }
+
+    /* 解析采样次数。 */
+    if (argc >= 2)
+    {
+        result = task5_parse_uint_arg(argv[1],
+                                     1U,
+                                     3000U,
+                                     &count);
+        if (result != RT_EOK)
+        {
+            rt_kprintf("[IMU][ARG_ERROR] count=%s range=1..3000\n",
+                       argv[1]);
+            return result;
+        }
+    }
+
+   /* 解析采样周期。 */
+    if (argc >= 3)
+    {
+        result = task5_parse_uint_arg(argv[2],
+                                     20U,
+                                     1000U,
+                                     &period_ms);
+        if (result != RT_EOK)
+        {
+            rt_kprintf("[IMU][ARG_ERROR] period_ms=%s range=20..1000\n",
+                       argv[2]);
+            return result;
+        }
+    }
+
+    /* 初始化项目侧传感器总线。 */
+    result = sensor_bus_port_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[IMU][BUS_INIT_ERROR] result=%d\n", (int)result);
+        return result;
+    }
+
+    /* 复位、配置并验证IMU。 */
+    result = lsm6ds3tr_c_init(&config);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[IMU][INIT_ERROR] result=%d\n", (int)result);
+        return result;
+    }
+
+    //打印实际配置读回值
+    rt_kprintf("[IMU][CONFIG][OK] "
+               "ctrl1_xl=0x%02X ctrl2_g=0x%02X ctrl3_c=0x%02X "
+               "count=%lu period_ms=%lu\n",
+               (unsigned int)config.ctrl1_xl,
+               (unsigned int)config.ctrl2_g,
+               (unsigned int)config.ctrl3_c,
+               (unsigned long)count,
+               (unsigned long)period_ms);
+
+    period_tick = rt_tick_from_millisecond((rt_int32_t)period_ms);  //将采样周期从毫秒转换为系统节拍数
+    for (index = 0U; index < count; index++)
+    {
+        iteration_start_tick = rt_tick_get();   //记录每次采样迭代的起始节拍数
+        attempt_count++;
+
+        result = lsm6ds3tr_c_read_sample(&sample);
+
+        if (result == RT_EOK)
+        {
+            success_count++;
+
+            if (have_previous_tick == RT_TRUE)
+            {
+                /*
+                 * rt_tick_t为无符号类型时，该减法可以处理一次正常回绕。
+                 */
+                delta =(rt_tick_t)(sample.sample_tick - previous_tick);
+
+                if (have_delta == RT_FALSE)
+                {
+                    minimum_delta = delta;
+                    maximum_delta = delta;
+                    have_delta = RT_TRUE;
+                }
+                else
+                {
+                   if (delta < minimum_delta)
+                    {
+                        minimum_delta = delta;
+                    }
+
+                    if (delta > maximum_delta)
+                    {
+                        maximum_delta = delta;
+                    }
+                }
+
+                delta_sum += (rt_uint64_t)delta;
+                delta_count++;
+            }
+
+            previous_tick = sample.sample_tick;
+            have_previous_tick = RT_TRUE;
+
+
+        rt_kprintf("[IMU][RAW] "
+                "i=%lu t=%lu st=0x%02X cfg=%lu "
+                "g=%d,%d,%d a=%d,%d,%d\n",
+                (unsigned long)index,
+                (unsigned long)sample.sample_tick,
+                (unsigned int)sample.status_reg,
+                (unsigned long)sample.config_version,
+                (int)sample.gyro_raw.x,
+                (int)sample.gyro_raw.y,
+                (int)sample.gyro_raw.z,
+                (int)sample.accel_raw.x,
+                (int)sample.accel_raw.y,
+                (int)sample.accel_raw.z);
+
+        rt_kprintf("[IMU][UNIT] "
+                "i=%lu gd=%ld,%ld,%ld au=%ld,%ld,%ld\n",
+                (unsigned long)index,
+                (long)sample.gyro_udps.x,
+                (long)sample.gyro_udps.y,
+                (long)sample.gyro_udps.z,
+                (long)sample.accel_ug.x,
+                (long)sample.accel_ug.y,
+                (long)sample.accel_ug.z);
+        }
+        else if (result == -RT_EBUSY)
+        {
+           not_ready_count++;
+
+            rt_kprintf("[IMU][NOT_READY] index=%lu result=%d\n",
+                       (unsigned long)index,
+                       (int)result);
+        }
+        else
+        {
+            failure_count++;
+
+           rt_kprintf("[IMU][READ_ERROR] index=%lu result=%d\n",
+                       (unsigned long)index,
+                       (int)result);
+        }
+
+        if ((index + 1U) < count)
+        {
+            current_tick = rt_tick_get();
+            elapsed_tick =(rt_tick_t)(current_tick - iteration_start_tick);
+
+            if (elapsed_tick < period_tick)
+            {
+                rt_thread_delay(period_tick - elapsed_tick);
+            }
+        }
+    }
+
+    rt_kprintf("[IMU][SUMMARY] "
+               "attempt=%lu success=%lu not_ready=%lu failure=%lu\n",
+               (unsigned long)attempt_count,
+               (unsigned long)success_count,
+               (unsigned long)not_ready_count,
+               (unsigned long)failure_count);
+
+    if (delta_count > 0U)
+    {
+        rt_kprintf("[IMU][INTERVAL] "
+                   "samples=%lu min_tick=%lu max_tick=%lu avg_tick=%lu\n",
+                   (unsigned long)delta_count,
+                   (unsigned long)minimum_delta,
+                   (unsigned long)maximum_delta,
+                   (unsigned long)(delta_sum /(rt_uint64_t)delta_count));
+    }
+    else
+    {
+        rt_kprintf("[IMU][INTERVAL] samples=0 result=N/A\n");
+    }
+    if ((failure_count != 0U) || (success_count == 0U))
+    {
+        return -RT_EIO;
+    }
+
+    return RT_EOK;
+}
+
 MSH_CMD_EXPORT(sensor_id_test,
-               read three sensor IDs; optional recover runs safe NACK test);
+                read three sensor IDs; optional recover runs safe NACK test);
+MSH_CMD_EXPORT(imu_sample_test,
+                sample LSM6DS3TR-C: imu_sample_test [count] [period_ms]);
 #endif
