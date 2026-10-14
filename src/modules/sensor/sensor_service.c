@@ -16,13 +16,19 @@ static rt_err_t task4_probe_mmc5603nj(void);                            //探测
 static rt_err_t task4_probe_ltr303(void);                               //探测LTR303ALS01传感器
 static rt_err_t task4_probe_all(rt_uint8_t *lsm_address);               //探测所有传感器并返回LSM6DS3TR-C的I2C地址
 static rt_err_t task4_failure_recovery_test(rt_uint8_t active_address); //探测LSM6DS3TR-C传感器并进行故障恢复测试
-static int sensor_id_test(int argc, char **argv);                       //通过FINSH命令行探测所有传感器并返回LSM6DS3TR-C的I2C地址
-static rt_err_t task5_parse_uint_arg(const char *text,
+static rt_err_t sensor_test_parse_uint_arg(const char *text,
                                      rt_uint32_t minimum,
                                      rt_uint32_t maximum,
                                      rt_uint32_t *value);               //解析FINSH命令行参数为无符号整数
-
+//shell测试
+//传感器id测试
+static int sensor_id_test(int argc, char **argv);                       //通过FINSH命令行探测所有传感器并返回LSM6DS3TR-C的I2C地址
+//LSM6DS3TR-C采样测试
 static int imu_sample_test(int argc, char **argv);                      //通过FINSH命令行读取LSM6DS3TR-C的陀螺仪和加速度计采样数据
+//MMC5603NJ采样测试
+static int mmc_sample_test(int argc, char **argv);                      //通过FINSH命令行读取MMC5603NJ的磁场采样数据
+static int mmc_set_reset_test(int argc, char **argv);                   //通过FINSH命令行执行MMC5603NJ的SET/RESET配对测量并计算磁场与桥路偏置
+static int mmc_ready_timeout_test(int argc, char **argv);               //通过FINSH命令行执行MMC5603NJ的ready超时测试并验证恢复能力
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 /*简介：读取实板LSM6DS3TR-C身份并输出已确认的I2C地址
   输入：active_address: 输出已确认的LSM6DS3TR-C有效7位I2C地址
@@ -325,7 +331,7 @@ static int sensor_id_test(int argc, char **argv)
  * 返回值：解析成功返回RT_EOK；参数为空、含非法字符或越界返回-RT_EINVAL。
  * 说明：只解析参数，不访问传感器、共享状态或UI对象。
  */
-static rt_err_t task5_parse_uint_arg(const char *text,
+static rt_err_t sensor_test_parse_uint_arg(const char *text,
                                      rt_uint32_t minimum,
                                      rt_uint32_t maximum,
                                      rt_uint32_t *value)
@@ -414,7 +420,7 @@ static int imu_sample_test(int argc, char **argv)
     /* 解析采样次数。 */
     if (argc >= 2)
     {
-        result = task5_parse_uint_arg(argv[1],
+        result = sensor_test_parse_uint_arg(argv[1],
                                      1U,
                                      3000U,
                                      &count);
@@ -429,7 +435,7 @@ static int imu_sample_test(int argc, char **argv)
    /* 解析采样周期。 */
     if (argc >= 3)
     {
-        result = task5_parse_uint_arg(argv[2],
+        result = sensor_test_parse_uint_arg(argv[2],
                                      20U,
                                      1000U,
                                      &period_ms);
@@ -594,8 +600,378 @@ static int imu_sample_test(int argc, char **argv)
     return RT_EOK;
 }
 
+/*
+ * 简介：按指定次数和周期执行MMC5603NJ单次磁场测量。
+ * 输入：mmc_sample_test [count] [period_ms]
+ * 说明：运行在FinSH线程，不创建后台线程，不修改UI对象。
+ */
+static int mmc_sample_test(int argc, char **argv)
+{
+    sensor_magnetometer_sample_t sample = {0};
+    rt_uint32_t count = 10U;
+    rt_uint32_t period_ms = 50U;
+    rt_uint32_t index;
+    rt_uint32_t attempt_count = 0U;
+    rt_uint32_t success_count = 0U;
+    rt_uint32_t timeout_count = 0U;
+    rt_uint32_t failure_count = 0U;
+
+    rt_tick_t period_tick;
+    rt_tick_t iteration_start_tick;
+    rt_tick_t current_tick;
+    rt_tick_t elapsed_tick;
+
+    rt_bool_t have_previous_tick = RT_FALSE;
+    rt_bool_t have_delta = RT_FALSE;
+    rt_tick_t previous_tick = 0U;
+    rt_tick_t delta;
+    rt_tick_t minimum_delta = 0U;
+    rt_tick_t maximum_delta = 0U;
+    rt_uint64_t delta_sum = 0U;
+    rt_uint32_t delta_count = 0U;
+
+    rt_err_t result;
+
+    if (argc > 3)
+    {
+        rt_kprintf(
+            "usage: mmc_sample_test [count] [period_ms]\n");
+        return -RT_EINVAL;
+    }
+
+    if (argc >= 2)
+    {
+        result = sensor_test_parse_uint_arg(
+            argv[1], 1U, 2000U, &count);
+        if (result != RT_EOK)
+        {
+            rt_kprintf(
+                "[MMC][ARG_ERROR] count=%s range=1..2000\n",
+                argv[1]);
+            return result;
+        }
+    }
+
+    if (argc >= 3)
+    {
+        result = sensor_test_parse_uint_arg(
+            argv[2], 10U, 1000U, &period_ms);
+        if (result != RT_EOK)
+        {
+            rt_kprintf(
+                "[MMC][ARG_ERROR] period_ms=%s range=10..1000\n",
+                argv[2]);
+            return result;
+        }
+    }
+
+    result = sensor_bus_port_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][BUS_INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    result = mmc5603nj_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    rt_kprintf(
+        "[MMC][CONFIG][OK] id=0x10 mode=single "
+        "bw=00 auto_sr=1 cfg=1 count=%lu period_ms=%lu\n",
+        (unsigned long)count,
+        (unsigned long)period_ms);
+
+    period_tick =
+        rt_tick_from_millisecond((rt_int32_t)period_ms);
+
+    for (index = 0U; index < count; index++)
+    {
+        iteration_start_tick = rt_tick_get();
+        attempt_count++;
+
+        result = mmc5603nj_read_sample(&sample);
+
+        if (result == RT_EOK)
+        {
+            success_count++;
+
+            if (have_previous_tick == RT_TRUE)
+            {
+                delta = (rt_tick_t)
+                    (sample.sample_tick - previous_tick);
+
+                if (have_delta == RT_FALSE)
+                {
+                    minimum_delta = delta;
+                    maximum_delta = delta;
+                    have_delta = RT_TRUE;
+                }
+                else
+                {
+                    if (delta < minimum_delta)
+                    {
+                        minimum_delta = delta;
+                    }
+
+                    if (delta > maximum_delta)
+                    {
+                        maximum_delta = delta;
+                    }
+                }
+
+                delta_sum += (rt_uint64_t)delta;
+                delta_count++;
+            }
+
+            previous_tick = sample.sample_tick;
+            have_previous_tick = RT_TRUE;
+
+            rt_kprintf(
+                "[MMC][RAW] i=%lu t=%lu st=0x%02X cfg=%lu "
+                "code=%lu,%lu,%lu centered=%ld,%ld,%ld\n",
+                (unsigned long)index,
+                (unsigned long)sample.sample_tick,
+                (unsigned int)sample.status_reg,
+                (unsigned long)sample.config_version,
+                (unsigned long)sample.code_u20.x,
+                (unsigned long)sample.code_u20.y,
+                (unsigned long)sample.code_u20.z,
+                (long)sample.centered_raw.x,
+                (long)sample.centered_raw.y,
+                (long)sample.centered_raw.z);
+
+            rt_kprintf(
+                "[MMC][UNIT] i=%lu nt=%ld,%ld,%ld\n",
+                (unsigned long)index,
+                (long)sample.field_nt.x,
+                (long)sample.field_nt.y,
+                (long)sample.field_nt.z);
+        }
+        else if (result == -RT_ETIMEOUT)
+        {
+            timeout_count++;
+
+            rt_kprintf(
+                "[MMC][READY_TIMEOUT] index=%lu result=%d\n",
+                (unsigned long)index,
+                (int)result);
+        }
+        else
+        {
+            failure_count++;
+
+            rt_kprintf(
+                "[MMC][READ_ERROR] index=%lu result=%d\n",
+                (unsigned long)index,
+                (int)result);
+        }
+
+        if ((index + 1U) < count)
+        {
+            current_tick = rt_tick_get();
+            elapsed_tick = (rt_tick_t)
+                (current_tick - iteration_start_tick);
+
+            if (elapsed_tick < period_tick)
+            {
+                rt_thread_delay(period_tick - elapsed_tick);
+            }
+        }
+    }
+
+    rt_kprintf(
+        "[MMC][SUMMARY] attempt=%lu success=%lu "
+        "timeout=%lu failure=%lu\n",
+        (unsigned long)attempt_count,
+        (unsigned long)success_count,
+        (unsigned long)timeout_count,
+        (unsigned long)failure_count);
+
+    if (delta_count > 0U)
+    {
+        rt_kprintf(
+            "[MMC][INTERVAL] samples=%lu min_tick=%lu "
+            "max_tick=%lu avg_tick=%lu\n",
+            (unsigned long)delta_count,
+            (unsigned long)minimum_delta,
+            (unsigned long)maximum_delta,
+            (unsigned long)
+                (delta_sum / (rt_uint64_t)delta_count));
+    }
+    else
+    {
+        rt_kprintf(
+            "[MMC][INTERVAL] samples=0 result=N/A\n");
+    }
+
+    if ((success_count != attempt_count) ||
+        (timeout_count != 0U) ||
+        (failure_count != 0U))
+    {
+        return -RT_EIO;
+    }
+
+    return RT_EOK;
+}
+
+/*
+ * 简介：执行一次显式SET/RESET配对测量。
+ */
+static int mmc_set_reset_test(int argc, char **argv)
+{
+    mmc5603nj_set_reset_result_t pair = {0};
+    rt_err_t result;
+
+    (void)argv;
+
+    if (argc != 1)
+    {
+        rt_kprintf("usage: mmc_set_reset_test\n");
+        return -RT_EINVAL;
+    }
+
+    result = sensor_bus_port_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][SR][BUS_INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    result = mmc5603nj_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][SR][INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    result = mmc5603nj_run_set_reset_pair(&pair);
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][SR][ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    rt_kprintf(
+        "[MMC][SR][SET] code=%lu,%lu,%lu "
+        "centered=%ld,%ld,%ld\n",
+        (unsigned long)pair.set_sample.code_u20.x,
+        (unsigned long)pair.set_sample.code_u20.y,
+        (unsigned long)pair.set_sample.code_u20.z,
+        (long)pair.set_sample.centered_raw.x,
+        (long)pair.set_sample.centered_raw.y,
+        (long)pair.set_sample.centered_raw.z);
+
+    rt_kprintf(
+        "[MMC][SR][RESET] code=%lu,%lu,%lu "
+        "centered=%ld,%ld,%ld\n",
+        (unsigned long)pair.reset_sample.code_u20.x,
+        (unsigned long)pair.reset_sample.code_u20.y,
+        (unsigned long)pair.reset_sample.code_u20.z,
+        (long)pair.reset_sample.centered_raw.x,
+        (long)pair.reset_sample.centered_raw.y,
+        (long)pair.reset_sample.centered_raw.z);
+
+    rt_kprintf(
+        "[MMC][SR][RESULT] field_raw=%ld,%ld,%ld "
+        "field_nt=%ld,%ld,%ld offset_raw=%ld,%ld,%ld\n",
+        (long)pair.field_centered_raw.x,
+        (long)pair.field_centered_raw.y,
+        (long)pair.field_centered_raw.z,
+        (long)pair.field_nt.x,
+        (long)pair.field_nt.y,
+        (long)pair.field_nt.z,
+        (long)pair.offset_centered_raw.x,
+        (long)pair.offset_centered_raw.y,
+        (long)pair.offset_centered_raw.z);
+
+    return RT_EOK;
+}
+
+/*
+ * 简介：验证未触发测量时ready等待会有限超时，
+ *       并证明超时后正常测量能够恢复。
+ */
+static int mmc_ready_timeout_test(int argc, char **argv)
+{
+    sensor_magnetometer_sample_t recovered = {0};
+    rt_uint32_t elapsed_ms = 0U;
+    rt_err_t result;
+
+    (void)argv;
+
+    if (argc != 1)
+    {
+        rt_kprintf("usage: mmc_ready_timeout_test\n");
+        return -RT_EINVAL;
+    }
+
+    result = sensor_bus_port_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][TIMEOUT][BUS_INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    result = mmc5603nj_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][TIMEOUT][INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    result = mmc5603nj_run_ready_timeout_test(
+        &elapsed_ms,
+        &recovered);
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[MMC][TIMEOUT][ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    rt_kprintf(
+        "[MMC][TIMEOUT][OK] expected_timeout=1 "
+        "elapsed_ms=%lu recovery_valid=%u "
+        "recovery_nt=%ld,%ld,%ld\n",
+        (unsigned long)elapsed_ms,
+        (unsigned int)recovered.valid,
+        (long)recovered.field_nt.x,
+        (long)recovered.field_nt.y,
+        (long)recovered.field_nt.z);
+
+    return RT_EOK;
+}
+
+
 MSH_CMD_EXPORT(sensor_id_test,
                 read three sensor IDs; optional recover runs safe NACK test);
 MSH_CMD_EXPORT(imu_sample_test,
                 sample LSM6DS3TR-C: imu_sample_test [count] [period_ms]);
+MSH_CMD_EXPORT(mmc_sample_test,
+               sample MMC5603NJ: mmc_sample_test [count] [period_ms]);
+
+MSH_CMD_EXPORT(mmc_set_reset_test,
+               run MMC5603NJ explicit SET and RESET pair);
+
+MSH_CMD_EXPORT(mmc_ready_timeout_test,
+               verify MMC5603NJ ready timeout and recovery);
 #endif
