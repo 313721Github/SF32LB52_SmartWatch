@@ -10,6 +10,149 @@
 #include <errno.h>
 #include <stdlib.h>
 
+/**
+ * @brief ALS照度公式单个构造测试用例
+ *
+ * 保存一组输入参数和对应的预期结果，由als_formula_test()
+ * 调用纯计算接口并逐字段比较。该结构只用于FinSH测试，
+ * 不参与实机样本发布。
+ */
+typedef struct
+{
+    const char *name;
+    /**< 测试用例名称，必须指向生命周期覆盖整个测试的只读字符串。 */
+
+    rt_uint16_t ch0_raw;
+    /**< 输入的CH0原始值。 */
+
+    rt_uint16_t ch1_raw;
+    /**< 输入的CH1原始值。 */
+
+    rt_uint16_t gain;
+    /**< 输入的实际增益倍数。 */
+
+    rt_uint16_t integration_ms;
+    /**< 输入的积分时间，单位ms。 */
+
+    rt_uint32_t expected_ratio_x10000;
+    /**< 预期通道比例，CH1/(CH0+CH1)放大10000倍并四舍五入。 */
+
+    rt_uint32_t expected_lux_mlux;
+    /**< 预期照度估算值，单位mlux。
+         当expected_lux_valid为RT_FALSE时通常约定为0。 */
+
+    rt_bool_t expected_lux_valid;
+    /**< 预期照度是否可信。 */
+
+    rt_bool_t expected_saturated;
+    /**< 预期是否检测到任一通道饱和。 */
+
+    sensor_als_estimate_reason_t expected_reason;
+    /**< 预期估算分类原因。 */
+} als_formula_case_t;
+
+static const als_formula_case_t g_als_formula_cases[] =
+{
+    {
+        "zero",
+        0U, 0U, 1U, 100U,
+        0U, 0U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_ZERO_COUNTS
+    },
+    {
+        "below_045",
+        5501U, 4499U, 1U, 100U,
+        4499U, 14735868U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "equal_045",
+        5500U, 4500U, 1U, 100U,
+        4500U, 14735150U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "below_064",
+        3601U, 6399U, 1U, 100U,
+        6399U, 2898113U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "equal_064",
+        3600U, 6400U, 1U, 100U,
+        6400U, 2891760U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "below_085",
+        1501U, 8499U, 1U, 100U,
+        8499U, 1896624U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "equal_085",
+        1500U, 8500U, 1U, 100U,
+        8500U, 0U,
+        RT_FALSE, RT_FALSE,
+        SENSOR_ALS_REASON_IR_DOMINANT
+    },
+    {
+        "wrong_branch_guard",
+        100U, 300U, 1U, 100U,
+        7500U, 94810U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "int32_overflow_guard",
+        60000U, 49091U, 1U, 100U,
+        4500U, 160746913U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "saturated",
+        65535U, 1000U, 1U, 100U,
+        150U, 0U,
+        RT_FALSE, RT_TRUE,
+        SENSOR_ALS_REASON_SATURATED
+    },
+    {
+        "normalize_1x_100ms",
+        1000U, 200U, 1U, 100U,
+        1667U, 1995480U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "normalize_1x_200ms",
+        1000U, 200U, 1U, 200U,
+        1667U, 997740U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "normalize_2x_100ms",
+        1000U, 200U, 2U, 100U,
+        1667U, 997740U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    },
+    {
+        "normalize_2x_200ms",
+        1000U, 200U, 2U, 200U,
+        1667U, 498870U,
+        RT_TRUE, RT_FALSE,
+        SENSOR_ALS_REASON_OK
+    }
+};
+
 //私有函数
 static rt_err_t task4_probe_lsm(rt_uint8_t *active_address);            //探测LSM6DS3TR-C传感器并返回其I2C地址
 static rt_err_t task4_probe_mmc5603nj(void);                            //探测MMC5603NJ传感器
@@ -29,6 +172,10 @@ static int imu_sample_test(int argc, char **argv);                      //通过
 static int mmc_sample_test(int argc, char **argv);                      //通过FINSH命令行读取MMC5603NJ的磁场采样数据
 static int mmc_set_reset_test(int argc, char **argv);                   //通过FINSH命令行执行MMC5603NJ的SET/RESET配对测量并计算磁场与桥路偏置
 static int mmc_ready_timeout_test(int argc, char **argv);               //通过FINSH命令行执行MMC5603NJ的ready超时测试并验证恢复能力
+//ltr303als01测试
+static const char *als_reason_name(sensor_als_estimate_reason_t reason);//把ALS估算原因枚举转换为固定字符串，供FinSH日志使用
+static int als_formula_test(int argc, char **argv);                     //运行14组构造值测试。
+static int als_sample_test(int argc, char **argv);                      //初始化LTR303ALS01并按指定次数和周期读取双通道样本
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 /*简介：读取实板LSM6DS3TR-C身份并输出已确认的I2C地址
   输入：active_address: 输出已确认的LSM6DS3TR-C有效7位I2C地址
@@ -962,6 +1109,490 @@ static int mmc_ready_timeout_test(int argc, char **argv)
 }
 
 
+static const char *als_reason_name(
+    sensor_als_estimate_reason_t reason)
+{
+    switch (reason)
+    {
+    case SENSOR_ALS_REASON_OK:
+        return "OK";
+
+    case SENSOR_ALS_REASON_ZERO_COUNTS:
+        return "ZERO_COUNTS";
+
+    case SENSOR_ALS_REASON_IR_DOMINANT:
+        return "IR_DOMINANT";
+
+    case SENSOR_ALS_REASON_SATURATED:
+        return "SATURATED";
+
+    case SENSOR_ALS_REASON_DEVICE_INVALID:
+        return "DEVICE_INVALID";
+
+    case SENSOR_ALS_REASON_GAIN_MISMATCH:
+        return "GAIN_MISMATCH";
+
+    case SENSOR_ALS_REASON_MATH_ERROR:
+        return "MATH_ERROR";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+/*
+ * 简介：使用14组构造值验证LTR303照度公式。
+ * 说明：不访问I2C，不初始化硬件，不修改UI对象。
+ */
+static int als_formula_test(int argc, char **argv)
+{
+    sensor_als_estimate_t actual;
+    const als_formula_case_t *test_case;
+
+    rt_uint32_t index;
+    rt_uint32_t passed = 0U;
+    rt_uint32_t total;
+
+    rt_bool_t matched;
+    rt_err_t result;
+
+    (void)argv;
+
+    if (argc != 1)
+    {
+        rt_kprintf("usage: als_formula_test\n");
+        return -RT_EINVAL;
+    }
+
+    total = (rt_uint32_t)
+        (sizeof(g_als_formula_cases) /
+         sizeof(g_als_formula_cases[0]));
+
+    for (index = 0U; index < total; index++)
+    {
+        test_case = &g_als_formula_cases[index];
+
+        /*
+         * 使用哨兵值覆盖actual，证明估算函数完整写入所有字段。
+         */
+        memset(&actual, 0xA5, sizeof(actual));
+
+        result = ltr303als01_estimate_lux(
+            test_case->ch0_raw,
+            test_case->ch1_raw,
+            test_case->gain,
+            test_case->integration_ms,
+            &actual);
+
+        /*
+         * 同时比较返回值和五个结果字段。
+         */
+        matched =
+            (result == RT_EOK) &&
+            (actual.ratio_x10000 ==
+             test_case->expected_ratio_x10000) &&
+            (actual.lux_mlux ==
+             test_case->expected_lux_mlux) &&
+            (actual.lux_valid ==
+             test_case->expected_lux_valid) &&
+            (actual.saturated ==
+             test_case->expected_saturated) &&
+            (actual.reason ==
+             test_case->expected_reason);
+
+        if (matched == RT_TRUE)
+        {
+            passed++;
+        }
+
+    rt_kprintf(
+        "[ALS][FORMULA][%s] "
+        "i=%lu name=%s result=%d\n",
+        (matched == RT_TRUE) ? "PASS" : "FAIL",
+        (unsigned long)index,
+        test_case->name,
+        (int)result);
+
+    rt_kprintf(
+        "[ALS][FORMULA][DATA] "
+        "ch0=%u ch1=%u g=%u im=%u "
+        "ratio=%lu mlux=%lu lv=%u sat=%u reason=%s\n",
+        (unsigned int)test_case->ch0_raw,
+        (unsigned int)test_case->ch1_raw,
+        (unsigned int)test_case->gain,
+        (unsigned int)test_case->integration_ms,
+        (unsigned long)actual.ratio_x10000,
+        (unsigned long)actual.lux_mlux,
+        (unsigned int)actual.lux_valid,
+        (unsigned int)actual.saturated,
+        als_reason_name(actual.reason));
+    }
+
+    rt_kprintf(
+        "[ALS][FORMULA][SUMMARY] "
+        "passed=%lu total=%lu result=%s\n",
+        (unsigned long)passed,
+        (unsigned long)total,
+        (passed == total) ? "PASS" : "FAIL");
+
+    return (passed == total) ? RT_EOK : -RT_EIO;
+}
+/*
+ * 简介：初始化LTR303并按指定次数和周期采集双通道样本。
+ * 输入：als_sample_test [count] [period_ms]
+ * 默认：count=10，period_ms=200。
+ * 返回值：测试通过返回RT_EOK；参数、初始化、超时、总线或
+ *         关键样本状态异常时返回对应错误。
+ * 说明：运行在FinSH线程，不创建后台线程，不修改UI对象。
+ */
+static int als_sample_test(int argc, char **argv)
+{
+    ltr303als01_config_readback_t config = {0};
+    sensor_als_sample_t sample = {0};
+
+    rt_uint32_t count = 10U;
+    rt_uint32_t period_ms = 200U;
+    rt_uint32_t index;
+
+    rt_uint32_t attempt_count = 0U;
+    rt_uint32_t raw_valid_count = 0U;
+    rt_uint32_t lux_valid_count = 0U;
+
+    rt_uint32_t zero_count = 0U;
+    rt_uint32_t ir_count = 0U;
+    rt_uint32_t saturated_count = 0U;
+    rt_uint32_t device_invalid_count = 0U;
+    rt_uint32_t gain_mismatch_count = 0U;
+    rt_uint32_t math_error_count = 0U;
+
+    rt_uint32_t timeout_count = 0U;
+    rt_uint32_t failure_count = 0U;
+
+    rt_tick_t period_tick;
+    rt_tick_t iteration_start_tick;
+    rt_tick_t current_tick;
+    rt_tick_t elapsed_tick;
+
+    rt_bool_t have_previous_tick = RT_FALSE;
+    rt_bool_t have_delta = RT_FALSE;
+
+    rt_tick_t previous_tick = 0U;
+    rt_tick_t delta;
+    rt_tick_t minimum_delta = 0U;
+    rt_tick_t maximum_delta = 0U;
+
+    rt_uint64_t delta_sum = 0U;
+    rt_uint32_t delta_count = 0U;
+
+    rt_err_t result;
+
+    if (argc > 3)
+    {
+        rt_kprintf(
+            "usage: als_sample_test [count] [period_ms]\n");
+        return -RT_EINVAL;
+    }
+
+    /* 解析采样次数。 */
+    if (argc >= 2)
+    {
+        result = sensor_test_parse_uint_arg(
+            argv[1],
+            1U,
+            2000U,
+            &count);
+        if (result != RT_EOK)
+        {
+            rt_kprintf(
+                "[ALS][ARG_ERROR] count=%s range=1..2000\n",
+                argv[1]);
+            return result;
+        }
+    }
+
+    /*
+     * 解析软件采样周期。
+     * 当前器件更新周期为200 ms，因此不允许配置得更短。
+     */
+    if (argc >= 3)
+    {
+        result = sensor_test_parse_uint_arg(
+            argv[2],
+            200U,
+            2000U,
+            &period_ms);
+        if (result != RT_EOK)
+        {
+            rt_kprintf(
+                "[ALS][ARG_ERROR] "
+                "period_ms=%s range=200..2000\n",
+                argv[2]);
+            return result;
+        }
+    }
+
+    /* 初始化项目侧传感器总线。 */
+    result = sensor_bus_port_init();
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[ALS][BUS_INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    /* 验证LTR303身份、写入冻结配置并核对读回值。 */
+    result = ltr303als01_init(&config);
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[ALS][INIT_ERROR] result=%d\n",
+            (int)result);
+        return result;
+    }
+
+    rt_kprintf(
+        "[ALS][CONFIG][OK] "
+        "contr=0x%02X rate=0x%02X "
+        "gain=1 int_ms=100 repeat_ms=200 cfg=1 "
+        "count=%lu period_ms=%lu\n",
+        (unsigned int)config.als_contr,
+        (unsigned int)config.als_meas_rate,
+        (unsigned long)count,
+        (unsigned long)period_ms);
+
+    period_tick =rt_tick_from_millisecond((rt_int32_t)period_ms);
+
+    for (index = 0U; index < count; index++)
+    {
+        iteration_start_tick = rt_tick_get();
+        attempt_count++;
+
+        result = ltr303als01_read_sample(&sample);
+
+        if (result == RT_EOK)
+        {
+            /*
+             * raw有效和照度有效是两层语义。
+             * 饱和或红外占优时raw仍可能有效，但lux无效。
+             */
+            if (sample.valid == RT_TRUE)
+            {
+                raw_valid_count++;
+            }
+
+            if (sample.estimate.lux_valid == RT_TRUE)
+            {
+                lux_valid_count++;
+            }
+
+            /* 统计本次样本的估算分类。 */
+            switch (sample.estimate.reason)
+            {
+            case SENSOR_ALS_REASON_OK:
+                break;
+
+            case SENSOR_ALS_REASON_ZERO_COUNTS:
+                zero_count++;
+                break;
+
+            case SENSOR_ALS_REASON_IR_DOMINANT:
+                ir_count++;
+                break;
+
+            case SENSOR_ALS_REASON_SATURATED:
+                saturated_count++;
+                break;
+
+            case SENSOR_ALS_REASON_DEVICE_INVALID:
+                device_invalid_count++;
+                break;
+
+            case SENSOR_ALS_REASON_GAIN_MISMATCH:
+                gain_mismatch_count++;
+                break;
+
+            case SENSOR_ALS_REASON_MATH_ERROR:
+                math_error_count++;
+                break;
+
+            default:
+                /*
+                 * 未知枚举表示驱动与测试入口的契约不一致，
+                 * 计入普通失败。
+                 */
+                failure_count++;
+                break;
+            }
+
+            /*
+             * 仅对raw有效样本统计采样完成时间间隔。
+             * rt_tick_t为无符号类型时，该减法可以处理一次正常回绕。
+             */
+            if (sample.valid == RT_TRUE)
+            {
+                if (have_previous_tick == RT_TRUE)
+                {
+                    delta = (rt_tick_t)
+                        (sample.sample_tick - previous_tick);
+
+                    if (have_delta == RT_FALSE)
+                    {
+                        minimum_delta = delta;
+                        maximum_delta = delta;
+                        have_delta = RT_TRUE;
+                    }
+                    else
+                    {
+                        if (delta < minimum_delta)
+                        {
+                            minimum_delta = delta;
+                        }
+
+                        if (delta > maximum_delta)
+                        {
+                            maximum_delta = delta;
+                        }
+                    }
+
+                    delta_sum += (rt_uint64_t)delta;
+                    delta_count++;
+                }
+
+                previous_tick = sample.sample_tick;
+                have_previous_tick = RT_TRUE;
+            }
+
+            rt_kprintf(
+                "[ALS][RAW] "
+                "i=%lu t=%lu st=0x%02X cfg=%lu "
+                "ch0=%u ch1=%u gain=%u valid=%u\n",
+                (unsigned long)index,
+                (unsigned long)sample.sample_tick,
+                (unsigned int)sample.status_reg,
+                (unsigned long)sample.config_version,
+                (unsigned int)sample.ch0_raw,
+                (unsigned int)sample.ch1_raw,
+                (unsigned int)sample.gain,
+                (unsigned int)sample.valid);
+
+            rt_kprintf(
+                "[ALS][LUX] "
+                "i=%lu ratio=%lu mlux=%lu "
+                "lux_valid=%u saturated=%u "
+                "calibrated=%u reason=%s\n",
+                (unsigned long)index,
+                (unsigned long)
+                    sample.estimate.ratio_x10000,
+                (unsigned long)
+                    sample.estimate.lux_mlux,
+                (unsigned int)
+                    sample.estimate.lux_valid,
+                (unsigned int)
+                    sample.estimate.saturated,
+                (unsigned int)sample.calibrated,
+                als_reason_name(
+                    sample.estimate.reason));
+        }
+        else if (result == -RT_ETIMEOUT)
+        {
+            timeout_count++;
+
+            rt_kprintf(
+                "[ALS][READY_TIMEOUT] "
+                "index=%lu result=%d\n",
+                (unsigned long)index,
+                (int)result);
+        }
+        else
+        {
+            failure_count++;
+
+            rt_kprintf(
+                "[ALS][READ_ERROR] "
+                "index=%lu result=%d\n",
+                (unsigned long)index,
+                (int)result);
+        }
+
+        /*
+         * 从本轮开始时刻补足软件周期，避免在读取耗时后再固定
+         * 延时period_ms而使实际周期持续变长。
+         */
+        if ((index + 1U) < count)
+        {
+            current_tick = rt_tick_get();
+            elapsed_tick = (rt_tick_t)
+                (current_tick - iteration_start_tick);
+
+            if (elapsed_tick < period_tick)
+            {
+                rt_thread_delay(
+                    period_tick - elapsed_tick);
+            }
+        }
+    }
+
+    rt_kprintf(
+        "[ALS][SUMMARY] "
+        "attempt=%lu raw_valid=%lu lux_valid=%lu "
+        "timeout=%lu failure=%lu\n",
+        (unsigned long)attempt_count,
+        (unsigned long)raw_valid_count,
+        (unsigned long)lux_valid_count,
+        (unsigned long)timeout_count,
+        (unsigned long)failure_count);
+
+    rt_kprintf(
+        "[ALS][CLASS1] "
+        "zero=%lu ir=%lu saturated=%lu\n",
+        (unsigned long)zero_count,
+        (unsigned long)ir_count,
+        (unsigned long)saturated_count);
+
+    rt_kprintf(
+        "[ALS][CLASS2] "
+        "device_invalid=%lu gain_mismatch=%lu math_error=%lu\n",
+        (unsigned long)device_invalid_count,
+        (unsigned long)gain_mismatch_count,
+        (unsigned long)math_error_count);
+
+    if (delta_count > 0U)
+    {
+        rt_kprintf(
+            "[ALS][INTERVAL] "
+            "samples=%lu min_tick=%lu "
+            "max_tick=%lu avg_tick=%lu\n",
+            (unsigned long)delta_count,
+            (unsigned long)minimum_delta,
+            (unsigned long)maximum_delta,
+            (unsigned long)
+                (delta_sum / (rt_uint64_t)delta_count));
+    }
+    else
+    {
+        rt_kprintf(
+            "[ALS][INTERVAL] samples=0 result=N/A\n");
+    }
+
+    /*
+     * IR_DOMINANT和SATURATED是有效环境分类，不直接使测试失败。
+     * 器件状态、配置、数学、总线或等待异常均使测试失败。
+     */
+    if ((raw_valid_count == 0U) ||
+        (timeout_count != 0U) ||
+        (failure_count != 0U) ||
+        (device_invalid_count != 0U) ||
+        (gain_mismatch_count != 0U) ||
+        (math_error_count != 0U))
+    {
+        return -RT_EIO;
+    }
+
+    return RT_EOK;
+}
+
+
 MSH_CMD_EXPORT(sensor_id_test,
                 read three sensor IDs; optional recover runs safe NACK test);
 MSH_CMD_EXPORT(imu_sample_test,
@@ -974,4 +1605,10 @@ MSH_CMD_EXPORT(mmc_set_reset_test,
 
 MSH_CMD_EXPORT(mmc_ready_timeout_test,
                verify MMC5603NJ ready timeout and recovery);
+
+MSH_CMD_EXPORT(als_formula_test,
+               verify LTR303 lux formula boundaries);
+
+MSH_CMD_EXPORT(als_sample_test,
+               sample LTR303: als_sample_test [count] [period_ms]);
 #endif
