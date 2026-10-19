@@ -49,8 +49,9 @@ rt_err_t ltr303als01_estimate_lux(
                             rt_uint16_t integration_ms,
                             sensor_als_estimate_t *estimate);   //根据LTR303ALS01双通道原始值估算照度
 
-rt_err_t ltr303als01_read_sample(
-                                sensor_als_sample_t *sample);   //等待新数据并读取一份LTR303ALS01双通道样本
+rt_err_t ltr303als01_read_sample(sensor_als_sample_t *sample);      //阻塞等待NEW并读取一份完整双通道样本
+rt_err_t ltr303als01_try_read_sample(sensor_als_sample_t *sample);  //单次检查NEW并在就绪时读取完整双通道样本 没有NEW返回-RT_EBUSY，不延时、不循环
+rt_err_t ltr303als01_reinitialize(ltr303als01_config_readback_t *readback); //强制重新验证LTR303身份并恢复冻结配置
 //私有函数声明
 
 static rt_err_t ltr303als01_read_config(
@@ -65,6 +66,8 @@ static rt_uint16_t ltr303als01_decode_u16(
 
 static rt_uint16_t ltr303als01_decode_status_gain(
                                     rt_uint8_t status_reg);     //将ALS_STATUS bits[6:4]的增益编码转换为实际增益倍数，未定义或保留编码返回0，由调用者判定为配置不匹配。
+static rt_err_t ltr303als01_read_sample_with_status(rt_uint8_t status,
+                                    sensor_als_sample_t *sample);//使用已经确认存在NEW的STATUS读取并解释完整双通道样本
 //---------------------------------------------------------------公开函数---------------------------------------------------------------
 /*
  * 简介：验证LTR303身份，写入冻结配置并核对实际读回值。
@@ -392,7 +395,7 @@ publish:
 }
 
 /*
- * 简介：等待NEW并读取一份成对的CH0/CH1样本。
+ * 简介：阻塞等待NEW并读取一份完整双通道样本
  * 输入：sample为调用者持有的输出缓冲区。
  * 返回值：成功形成完整诊断样本返回RT_EOK；
  *         空指针返回-RT_EINVAL；
@@ -402,11 +405,7 @@ publish:
  */
 rt_err_t ltr303als01_read_sample(sensor_als_sample_t *sample)
 {
-    sensor_als_sample_t candidate = {0};
-
-    rt_uint8_t data[LTR303ALS01_DATA_LENGTH] = {0};
     rt_uint8_t status = 0U;
-
     rt_err_t result;
 
     if (sample == RT_NULL)
@@ -419,98 +418,61 @@ rt_err_t ltr303als01_read_sample(sensor_als_sample_t *sample)
         return -RT_ENOSYS;
     }
 
-    /* 有限等待一份新数据，并保留本轮完整状态寄存器。 */
     result = ltr303als01_wait_new_data(&status);
     if (result != RT_EOK)
     {
         return result;
     }
 
-    /*
-     * 从CH1低字节开始一次连续读取4字节。
-     * 不能拆成CH1和CH0两个独立事务，否则可能破坏通道配对关系。
-     */
+    return ltr303als01_read_sample_with_status(status, sample);
+}
+
+
+/*
+ * 简介：单次检查NEW并读取一份完整双通道样本。
+ * 返回值：NEW未置位返回-RT_EBUSY，不延时、不轮询。
+ */
+rt_err_t ltr303als01_try_read_sample(sensor_als_sample_t *sample)
+{
+    rt_uint8_t status = 0U;
+    rt_err_t result;
+
+    if (sample == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (g_ltr303als01_initialized == RT_FALSE)
+    {
+        return -RT_ENOSYS;
+    }
+
     result = sensor_bus_port_read_reg(LTR303ALS01_ADDRESS,
-                                LTR303ALS01_DATA_CH1_0_REG,
-                                data,
-                                LTR303ALS01_DATA_LENGTH);
+                                LTR303ALS01_ALS_STATUS_REG,
+                                &status,
+                                1U);
     if (result != RT_EOK)
     {
         return result;
     }
 
-    /* 时间戳表示4字节burst完整进入MCU后的时刻。 */
-    candidate.sample_tick = rt_tick_get();
-
-    /* 寄存器顺序为CH1_L、CH1_H、CH0_L、CH0_H。 */
-    candidate.ch1_raw =ltr303als01_decode_u16(data[0], data[1]);
-
-    candidate.ch0_raw =ltr303als01_decode_u16(data[2], data[3]);
-
-    /* 保存本样本对应的状态和冻结配置语义。 */
-    candidate.status_reg = status;
-    candidate.config_version = LTR303ALS01_CONFIG_VERSION;
-    candidate.integration_ms = LTR303ALS01_INTEGRATION_MS;
-    candidate.repeat_ms = LTR303ALS01_REPEAT_MS;
-    candidate.calibrated = RT_FALSE;
-
-    /* 将STATUS中的增益编码转换为实际倍数。 */
-    candidate.gain =ltr303als01_decode_status_gain(status);
-
-    /*
-     * burst已经完整读取，但器件声明本轮数据无效。
-     * 输出诊断样本并返回RT_EOK，由调用者检查valid和reason。
-     */
-    if ((status & LTR303ALS01_STATUS_INVALID_MASK) != 0U)
+    if ((status & LTR303ALS01_STATUS_NEW_MASK) == 0U)
     {
-        candidate.valid = RT_FALSE;
-        candidate.estimate.lux_valid = RT_FALSE;
-        candidate.estimate.saturated = RT_FALSE;
-        candidate.estimate.reason =
-            SENSOR_ALS_REASON_DEVICE_INVALID;
-
-        *sample = candidate;
-        return RT_EOK;
+        return -RT_EBUSY;
     }
 
-    /*
-     * 保留编码会解码为0；其他非1X编码也不符合冻结配置。
-     * 两种情况都不能带入照度公式。
-     */
-    if (candidate.gain != LTR303ALS01_GAIN)
-    {
-        candidate.valid = RT_FALSE;
-        candidate.estimate.lux_valid = RT_FALSE;
-        candidate.estimate.saturated = RT_FALSE;
-        candidate.estimate.reason =
-            SENSOR_ALS_REASON_GAIN_MISMATCH;
+    return ltr303als01_read_sample_with_status(status, sample);
+}
 
-        *sample = candidate;
-        return RT_EOK;
-    }
+/*
+ * 简介：强制重新验证LTR303身份并恢复冻结配置。
+ * 说明：离线重探不能只检查旧配置，必须重新确认ID。
+ */
+rt_err_t ltr303als01_reinitialize(ltr303als01_config_readback_t *readback)
+{
+    g_ltr303als01_initialized = RT_FALSE;
 
-    /* 状态和实际增益正常后执行纯照度估算。 */
-    result = ltr303als01_estimate_lux(
-        candidate.ch0_raw,
-        candidate.ch1_raw,
-        candidate.gain,
-        candidate.integration_ms,
-        &candidate.estimate);
-    if (result != RT_EOK)
-    {
-        /*
-         * 这里使用的参数来自冻结配置，正常情况下不应失败。
-         * 若仍失败，按驱动错误处理，不发布部分candidate。
-         */
-        return result;
-    }
-
-    candidate.valid = RT_TRUE;
-
-    /* 所有处理完成后一次性提交完整样本。 */
-    *sample = candidate;
-
-    return RT_EOK;
+    return ltr303als01_init(readback);
 }
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 
@@ -664,4 +626,80 @@ static rt_uint16_t ltr303als01_decode_u16(
     default:
         return 0U;
     }
+}
+/*
+ * 简介：使用已经确认存在NEW的STATUS读取并解释完整双通道样本。
+ * 说明：失败时不修改调用者sample。
+ */
+static rt_err_t ltr303als01_read_sample_with_status(
+    rt_uint8_t status,
+    sensor_als_sample_t *sample)
+{
+    sensor_als_sample_t candidate = {0};
+    rt_uint8_t data[LTR303ALS01_DATA_LENGTH] = {0};
+    rt_err_t result;
+
+    result = sensor_bus_port_read_reg(LTR303ALS01_ADDRESS,
+                                LTR303ALS01_DATA_CH1_0_REG,
+                                data,
+                                LTR303ALS01_DATA_LENGTH);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    candidate.sample_tick = rt_tick_get();
+
+    /* 寄存器顺序固定为CH1_L、CH1_H、CH0_L、CH0_H。 */
+    candidate.ch1_raw =
+        ltr303als01_decode_u16(data[0], data[1]);
+
+    candidate.ch0_raw =
+        ltr303als01_decode_u16(data[2], data[3]);
+
+    candidate.status_reg = status;
+    candidate.config_version = LTR303ALS01_CONFIG_VERSION;
+    candidate.integration_ms = LTR303ALS01_INTEGRATION_MS;
+    candidate.repeat_ms = LTR303ALS01_REPEAT_MS;
+    candidate.calibrated = RT_FALSE;
+
+    candidate.gain =
+        ltr303als01_decode_status_gain(status);
+
+    if ((status & LTR303ALS01_STATUS_INVALID_MASK) != 0U)
+    {
+        candidate.valid = RT_FALSE;
+        candidate.estimate.lux_valid = RT_FALSE;
+        candidate.estimate.saturated = RT_FALSE;
+        candidate.estimate.reason =SENSOR_ALS_REASON_DEVICE_INVALID;
+
+        *sample = candidate;
+        return RT_EOK;
+    }
+
+    if (candidate.gain != LTR303ALS01_GAIN)
+    {
+        candidate.valid = RT_FALSE;
+        candidate.estimate.lux_valid = RT_FALSE;
+        candidate.estimate.saturated = RT_FALSE;
+        candidate.estimate.reason =SENSOR_ALS_REASON_GAIN_MISMATCH;
+
+        *sample = candidate;
+        return RT_EOK;
+    }
+
+    result = ltr303als01_estimate_lux(candidate.ch0_raw,
+                                        candidate.ch1_raw,
+                                        candidate.gain,
+                                        candidate.integration_ms,
+                                        &candidate.estimate);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    candidate.valid = RT_TRUE;
+    *sample = candidate;
+
+    return RT_EOK;
 }

@@ -128,7 +128,9 @@ rt_err_t mmc5603nj_read_sample(sensor_magnetometer_sample_t *sample);           
 rt_err_t mmc5603nj_run_set_reset_pair(mmc5603nj_set_reset_result_t *result);    //执行一次SET/RESET配对测量，获取磁场和偏置结果
 rt_err_t mmc5603nj_run_ready_timeout_test(rt_uint32_t *timeout_elapsed_ms,
                             sensor_magnetometer_sample_t *recovered_sample);    //执行一次安全的ready超时与恢复测试
-
+rt_err_t mmc5603nj_start_measurement(void);                                     //启动一次普通磁场测量,只写测量命令，不等待ready
+rt_err_t mmc5603nj_try_read_sample(sensor_magnetometer_sample_t *sample);       //单次检查ready并在就绪时读取完整样本
+rt_err_t mmc5603nj_reinitialize(void);                                          //强制重新验证身份并恢复冻结配置,只能由唯一sensor线程调用，用于离线重探
 //私有函数声明
 static rt_uint32_t mmc5603nj_decode_u20(rt_uint8_t high,
                                        rt_uint8_t middle,
@@ -473,9 +475,81 @@ rt_err_t mmc5603nj_run_ready_timeout_test(
 
     return RT_EOK;
 }
+/*
+ * 简介：启动一次普通单次磁场测量。
+ * 返回值：成功写入测量命令返回RT_EOK；
+ *         未初始化返回-RT_ENOSYS；
+ *         总线错误原样返回。
+ * 说明：本函数只发送触发命令，不等待ready。
+ */
+rt_err_t mmc5603nj_start_measurement(void)
+{
+    rt_uint8_t command = MMC5603NJ_NORMAL_MEASURE_VALUE;
 
+    if (g_mmc5603nj_initialized == RT_FALSE)
+    {
+        return -RT_ENOSYS;
+    }
 
+    return sensor_bus_port_write_reg(
+        MMC5603NJ_ADDRESS,
+        MMC5603NJ_CONTROL0_REG,
+        &command,
+        1U);
+}
 
+/*
+ * 简介：单次检查ready，并在就绪时读取一份完整磁场样本。
+ * 返回值：成功返回RT_EOK；
+ *         尚未ready返回-RT_EBUSY；
+ *         参数、初始化或总线错误返回相应错误。
+ * 说明：不循环、不延时；失败时不修改调用者sample。
+ */
+rt_err_t mmc5603nj_try_read_sample(sensor_magnetometer_sample_t *sample)
+{
+    rt_uint8_t status = 0U;
+    rt_err_t result;
+
+    if (sample == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (g_mmc5603nj_initialized == RT_FALSE)
+    {
+        return -RT_ENOSYS;
+    }
+
+    result = sensor_bus_port_read_reg(MMC5603NJ_ADDRESS,
+                                        MMC5603NJ_STATUS1_REG,
+                                        &status,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    if ((status & MMC5603NJ_MEAS_M_DONE_MASK) == 0U)
+    {
+        return -RT_EBUSY;
+    }
+
+    return mmc5603nj_read_output(status, sample);
+}
+
+/*
+ * 简介：强制重新验证MMC5603NJ身份并恢复冻结配置。
+ * 返回值：完整重新初始化成功返回RT_EOK；身份、配置或总线失败返回对应错误。
+ * 说明：只能由唯一sensor线程调用。
+ *       先清除驱动内部初始化状态，再复用完整初始化路径；
+ *       失败后保持未初始化，不能继续读取样本。
+ */
+rt_err_t mmc5603nj_reinitialize(void)
+{
+    g_mmc5603nj_initialized = RT_FALSE;
+
+    return mmc5603nj_init();
+}
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 /*
  * 简介：拼接单轴20位无符号输出。

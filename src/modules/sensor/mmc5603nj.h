@@ -33,4 +33,7 @@ rt_err_t mmc5603nj_read_sample(sensor_magnetometer_sample_t *sample);           
 rt_err_t mmc5603nj_run_set_reset_pair(mmc5603nj_set_reset_result_t *result);    //执行一次SET/RESET配对测量，获取磁场和偏置结果
 rt_err_t mmc5603nj_run_ready_timeout_test(rt_uint32_t *timeout_elapsed_ms,
                             sensor_magnetometer_sample_t *recovered_sample);    //执行一次安全的ready超时与恢复测试
+rt_err_t mmc5603nj_start_measurement(void);                                     //启动一次普通磁场测量,只写测量命令，不等待ready
+rt_err_t mmc5603nj_try_read_sample(sensor_magnetometer_sample_t *sample);       //单次检查ready并在就绪时读取完整样本
+rt_err_t mmc5603nj_reinitialize(void);                                          //强制重新验证身份并恢复冻结配置,只能由唯一sensor线程调用，用于离线重探
 #endif

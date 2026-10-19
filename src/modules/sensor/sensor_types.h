@@ -255,6 +255,130 @@ typedef struct
          因此lux_mlux只能称为未标定照度估算值。 */
 } sensor_als_sample_t;
 
+
+/**
+ * @brief 统一服务中的器件编号
+ */
+typedef enum
+{
+    SENSOR_DEVICE_IMU = 0,
+    SENSOR_DEVICE_MMC,
+    SENSOR_DEVICE_ALS,
+    SENSOR_DEVICE_COUNT
+} sensor_device_id_t;
+
+/**
+ * @brief 单个器件运行状态
+ */
+typedef enum
+{
+    SENSOR_DEVICE_STATE_UNINITIALIZED = 0,
+    SENSOR_DEVICE_STATE_READY,
+    SENSOR_DEVICE_STATE_TEMP_FAILED,
+    SENSOR_DEVICE_STATE_OFFLINE
+} sensor_device_state_t;
+
+/**
+ * @brief 单个器件随快照发布的状态
+ *
+ * valid表示服务曾经取得过完整有效样本。
+ * state和stale决定这份last-good数据现在是否仍适合业务使用。
+ */
+typedef struct
+{
+    sensor_device_state_t state;//器件当前状态：未初始化、就绪、暂时失败或离线
+
+    rt_bool_t valid;          //是否已经取得过完整有效样本
+    rt_bool_t stale;          //last-good样本是否过期
+
+    rt_uint32_t seq;          //器件样本序号
+    rt_uint32_t config_version;//last-good样本使用的配置版本
+    rt_tick_t sample_tick;    //last-good样本的采样完成tick
+    rt_tick_t last_success_tick;//last-good样本的采样完成时间
+    rt_tick_t age_ticks;      //调用者读取快照时，距离last_success_tick经过的tick数
+
+    rt_err_t last_error;      //最近一次器件操作结果
+} sensor_device_status_t;
+
+/**
+ * @brief 单个器件累计统计
+ */
+typedef struct
+{
+    rt_uint32_t attempt_count;     //实际发起器件操作的总次数
+    rt_uint32_t success_count;     //完整有效样本成功读取、换算并提交的次数
+    rt_uint32_t failure_count;     //实际失败次数，不包含正常的-RT_EBUSY未就绪结果
+    rt_uint32_t timeout_count;     //测量、ready等待或底层操作超过规定上界的次数
+    rt_uint32_t not_ready_count;   //单次检查返回-RT_EBUSY的次数，表示数据暂未就绪，不应直接等同于器件故障
+    rt_uint32_t retry_count;       //器件处于TEMP_FAILED后执行受控重试的次数。不包含同一轮中的无限或紧密重试
+
+
+    rt_uint32_t consecutive_failure_count;   //当前连续失败次数
+    rt_uint32_t recovery_count;              //器件从TEMP_FAILED或OFFLINE恢复并成功提交第一份，完整有效样本的次数。首次正常启动不计为恢复
+
+    rt_uint32_t late_count;                  //调度函数开始执行时已经晚于目标期限的次数
+    rt_uint32_t missed_count;                //因执行时间过长或系统调度延迟而主动跳过的采样周期数
+
+    rt_tick_t last_operation_ticks;          //最近一次实际驱动调用占用sensor线程的时间
+    rt_tick_t max_operation_ticks;           //本次服务启动以来，单次实际驱动调用占用sensor线程的最大tick数，用于检查慢操作是否破坏最快采样周期
+} sensor_device_stats_t;
+
+/**
+ * @brief 三器件最新一致快照
+ *
+ * 本结构始终复制给调用者，服务不得返回内部对象指针。
+ */
+typedef struct
+{
+    rt_uint32_t publish_seq;                 //服务级发布序号
+    rt_tick_t snapshot_tick;                 //用者取得本快照副本的系统tick
+
+    sensor_device_status_t imu_status;       // IMU当前状态、样本序号、年龄和最近错误
+    sensor_device_status_t mmc_status;       //磁力计当前状态、样本序号、年龄和最近错误
+    sensor_device_status_t als_status;       //环境光传感器当前状态、样本序号、年龄和最近错误
+
+    sensor_imu_sample_t imu;                 //IMU最近一份完整有效的last-good样本
+    sensor_magnetometer_sample_t mmc;        //MMC5603NJ最近一份完整有效的last-good样本
+    sensor_als_sample_t als;                 //LTR303ALS01最近一份完整有效的last-good样本
+} sensor_snapshot_t;
+
+/**
+ * @brief 统一服务统计
+ */
+typedef struct
+{
+    rt_uint32_t loop_count;        //sensor调度循环执行总次数
+    rt_uint32_t wake_count;        //sensor线程从event等待中返回的总次数
+    rt_uint32_t publish_count;     //快照内容或对外状态成功提交的总次数
+
+    rt_uint32_t notify_count;      //通知回调成功执行并返回RT_EOK的次数
+    rt_uint32_t notify_drop_count; //通知回调返回错误或下游拒绝通知的次数
+
+    rt_uint32_t snapshot_lock_timeout_count;//外部读取快照或统计时，未能在规定上界内取得snapshot mutex的次
+    rt_uint32_t probe_request_count;//外部成功提交重探请求的次数，多个请求可能通过器件位图合并，因此不等同于实际重探次数
+
+    rt_tick_t last_loop_ticks;      //最近一轮sensor调度循环占用线程的tick数
+    rt_tick_t max_loop_ticks;       //本次服务启动以来，单轮调度循环占用线程的最大tick数，用于判断整轮处理是否可能破坏最快采样周期
+
+    sensor_device_stats_t imu;     //IMU累计采样、未就绪、失败、恢复和调度统计
+    sensor_device_stats_t mmc;     //MMC5603NJ累计触发、检查、失败、恢复和调度统计
+    sensor_device_stats_t als;     //LTR303ALS01累计检查、采样、失败、恢复和调度统计
+} sensor_service_stats_t;
+
+/**
+ * @brief 诊断故障注入类型
+ *
+ * 默认必须为NONE。该类型只验证服务失败分支，不代表真实总线波形。
+ */
+typedef enum
+{
+    SENSOR_TEST_FAULT_NONE = 0,
+    SENSOR_TEST_FAULT_BUS_IO,
+    SENSOR_TEST_FAULT_SHORT_TRANSFER,
+    SENSOR_TEST_FAULT_TIMEOUT
+} sensor_test_fault_t;
+
+
 #ifdef __cplusplus
 }
 #endif

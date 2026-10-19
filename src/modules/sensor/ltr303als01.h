@@ -40,6 +40,7 @@ rt_err_t ltr303als01_estimate_lux(
                             rt_uint16_t integration_ms,
                             sensor_als_estimate_t *estimate);   //根据LTR303ALS01双通道原始值估算照度
 
-rt_err_t ltr303als01_read_sample(
-                                sensor_als_sample_t *sample);   //等待新数据并读取一份LTR303ALS01双通道样本
+rt_err_t ltr303als01_read_sample(sensor_als_sample_t *sample);          //等待新数据并读取一份LTR303ALS01双通道样本
+rt_err_t ltr303als01_try_read_sample(sensor_als_sample_t *sample);      //单次检查NEW并在就绪时读取完整双通道样本
+rt_err_t ltr303als01_reinitialize(ltr303als01_config_readback_t *readback); //强制重新验证LTR303身份并恢复冻结配置
 #endif
