@@ -4,6 +4,7 @@
 #include "rthw.h"
 #include "ui_runtime.h"
 #include "ui_event.h"
+#include "sensor_service.h"
 
 #define APP_EVENT_QUEUE_DEPTH  8U
 #define APP_THREAD_STACK_SIZE  2048U
@@ -223,6 +224,37 @@ rt_err_t app_main_init(void)
             result);
         }
     }
+    /*
+     * 启动统一sensor服务。
+     *
+     * 设计边界：
+     * 1. app层只启动服务，不访问I2C或具体器件驱动；
+     * 2. RT_EOK只表示sensor线程和服务资源已经启动，
+     *    不表示三颗器件均已READY或已有有效样本；
+     * 3. sensor启动失败属于降级运行，不能破坏已经建立的
+     *    app队列、按键、UI线程和触摸功能；
+     * 4. UI诊断页会在500ms刷新中显示WAIT或快照错误；
+     * 5. sensor_service_init()具有幂等语义，服务已经运行时
+     *    再次调用仍返回RT_EOK，不会创建第二个sensor线程。
+     */
+    result = sensor_service_init();
+
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[APP][SENSOR][WARN] "
+            "service start failed: %d, "
+            "application remains available\n",
+            (int)result);
+    }
+    else
+    {
+        rt_kprintf(
+            "[APP][SENSOR][OK] "
+            "service thread started, "
+            "device readiness is asynchronous\n");
+    }
+
     return RT_EOK;
 
 }
@@ -726,6 +758,8 @@ static int app_stats(void)
     rt_uint32_t max_inflight;
     rt_uint32_t inflight;
 
+    rt_bool_t sensor_running;
+
     rt_base_t level;
 
     //短暂关闭中断取得快照
@@ -754,6 +788,9 @@ static int app_stats(void)
 
     rt_hw_interrupt_enable(level);
 
+    //sensor_running只表示统一服务线程处于RUNNING，不表示IMU、MMC和ALS全部READY
+    sensor_running =sensor_service_is_running();
+
     rt_kprintf(
         "[APP][STATS] initialized=%u queue=%u thread=%u\n",
         (unsigned int)initialized,
@@ -761,10 +798,13 @@ static int app_stats(void)
         (unsigned int)thread_ready);
 
     rt_kprintf(
-        "[APP][STATS] button=%u indicator=%u ui=%u state=%d\n",
+        "[APP][STATS] "
+        "button=%u indicator=%u ui=%u sensor=%u "
+        "indicator_state=%d\n",
         (unsigned int)button_available,
         (unsigned int)indicator_available,
         (unsigned int)ui_available,
+        (unsigned int)sensor_running,
         (int)indicator_state);
 
     rt_kprintf(

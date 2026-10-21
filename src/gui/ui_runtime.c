@@ -1753,11 +1753,13 @@ static int ui_stats(void)
 {
     ui_runtime_stats_t stats;
     ui_page_stats_t ui_page_stats;
+    ui_sensor_diag_stats_t sensor_diag_stats;
     rt_err_t result;
 
+    rt_uint32_t pending;
     rt_uint32_t inflight;
-
     result = ui_runtime_get_stats(&stats);
+
     if (result != RT_EOK)
     {
         rt_kprintf(
@@ -1766,7 +1768,22 @@ static int ui_stats(void)
         return (int)result;
     }
 
-    inflight = stats.posted - stats.consumed;
+    /*
+     * 只复制诊断页值类型统计。
+     * 本命令不读取或修改任何LVGL对象。
+     */
+    result =ui_page_get_sensor_diag_stats(&sensor_diag_stats);
+
+    if (result != RT_EOK)
+    {
+        rt_kprintf(
+            "[UI][SENSOR_DIAG][ERROR] "
+            "get stats failed: %d\n",
+            (int)result);
+
+        return (int)result;
+    }
+
     rt_kprintf(
         "[UI][STATS] state=%d thread=%p ready_tick=%u\n",
         (int)stats.state,
@@ -1807,7 +1824,6 @@ static int ui_stats(void)
         (unsigned int)stats.hor_res,
         (unsigned int)stats.ver_res);
 
-    rt_uint32_t pending;
 
     /*
      * 正常稳定状态应当posted >= consumed。
@@ -1822,6 +1838,12 @@ static int ui_stats(void)
     {
         pending = 0;
     }
+    /*
+     * inflight和pending在本命令中使用同一安全语义。
+     * 避免并发读取瞬间发生无符号下溢。
+     */
+    inflight = pending;
+
     rt_kprintf(
         "[UI][EVENT] queue=%p ready=%u depth=%u\n",
         stats.event_queue,
@@ -1895,7 +1917,70 @@ static int ui_stats(void)
                 (unsigned int)stats.max_latency_ticks,
                 (unsigned int)stats.last_complete_latency_ticks,
                 (unsigned int)stats.max_complete_latency_ticks);
+    /*
+     * timer、可见刷新和隐藏跳过用于证明：
+     * 页面隐藏时UI没有持续读取快照或更新对象。
+     */
+    rt_kprintf(
+        "[UI][SENSOR_DIAG] "
+        "timer=%u visible=%u hidden_skip=%u\n",
+        (unsigned int)
+            sensor_diag_stats.timer_fire_count,
+        (unsigned int)
+            sensor_diag_stats.visible_refresh_count,
+        (unsigned int)
+            sensor_diag_stats.hidden_skip_count);
 
+    /*
+     * snapshot_success/failure描述内存快照接口结果。
+     * 它们不等同于底层I2C事务成功或失败次数。
+     */
+    rt_kprintf(
+        "[UI][SENSOR_DIAG] "
+        "snapshot_ok=%u snapshot_fail=%u "
+        "last_error=%d\n",
+        (unsigned int)
+            sensor_diag_stats.snapshot_success_count,
+        (unsigned int)
+            sensor_diag_stats.snapshot_failure_count,
+        (int)
+            sensor_diag_stats.last_snapshot_error);
+
+    /*
+     * UI最多以2Hz显示最新状态。
+     * 两次刷新之间的高频sensor发布由快照语义自然合并，
+     * 不会逐条塞入8槽ui_evt队列。
+     */
+    rt_kprintf(
+        "[UI][SENSOR_DIAG] "
+        "render=%u unchanged=%u coalesced=%u "
+        "last_publish=%u\n",
+        (unsigned int)
+            sensor_diag_stats.render_count,
+        (unsigned int)
+            sensor_diag_stats.unchanged_skip_count,
+        (unsigned int)
+            sensor_diag_stats.coalesced_publish_count,
+        (unsigned int)
+            sensor_diag_stats.last_publish_seq);
+
+    /*
+     * copy_ticks是取得一致快照的代码耗时；
+     * render_ticks是更新LVGL对象的代码耗时；
+     * 两者都不是AMOLED物理出屏延迟。
+     */
+    rt_kprintf(
+        "[UI][SENSOR_DIAG] "
+        "copy_ticks last=%u max=%u "
+        "render_ticks last=%u max=%u\n",
+        (unsigned int)
+            sensor_diag_stats.last_snapshot_copy_ticks,
+        (unsigned int)
+            sensor_diag_stats.max_snapshot_copy_ticks,
+        (unsigned int)
+            sensor_diag_stats.last_render_ticks,
+        (unsigned int)
+            sensor_diag_stats.max_render_ticks);
 
     return 0;
 }
