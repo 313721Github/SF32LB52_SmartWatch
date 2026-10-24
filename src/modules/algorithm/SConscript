@@ -1,0 +1,28 @@
+from building import *
+
+# 当前目录为src/modules/algorithm。
+cwd = GetCurrentDir()
+
+# 自动收集本目录中的step_detector.c等所有C源文件。
+# 后续若增加纯算法文件，不需要逐个修改本文件。
+src = Glob('*.c')
+
+# 把当前目录加入头文件搜索路径，使其他模块能够：
+# #include "step_detector.h"
+inc = [
+    cwd,
+]
+
+# 计步算法是与I2C、传感器型号、LVGL和FinSH无关的纯C模块，
+# 因此不依赖BSP_USING_I2C3等硬件配置，始终参与项目构建。
+#
+# 当前项目其他无条件子模块使用depend=['']，
+# 这里保持相同的SCons组织方式。
+group = DefineGroup(
+    'algorithm_module',
+    src,
+    depend=[''],
+    CPPPATH=inc
+)
+
+Return('group')

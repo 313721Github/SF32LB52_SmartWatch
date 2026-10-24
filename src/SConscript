@@ -10,6 +10,7 @@ inc = [
     os.path.join(cwd, 'modules'),
     os.path.join(cwd, 'modules', 'mem'),
     os.path.join(cwd, 'modules', 'sensor'),
+    os.path.join(cwd, 'modules', 'algorithm'),
     os.path.join(cwd, 'gui'),
     os.path.join(cwd, 'apps'),
 ]
@@ -18,8 +19,8 @@ inc = [
 # 如果你以后加了新文件夹，就在这里补一行
 src.extend(SConscript(os.path.join(cwd, 'main/SConscript'), variant_dir="main", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'modules/SConscript'), variant_dir="modules", duplicate=0))
-src.extend(SConscript(os.path.join(cwd, 'modules/sensor/SConscript'),
-    variant_dir="modules_sensor",duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'modules/sensor/SConscript'),variant_dir="modules_sensor",duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'modules/algorithm/SConscript'),variant_dir="modules_algorithm", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'gui/SConscript'), variant_dir="gui", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'modules/mem/SConscript'), variant_dir="modules_mem", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'hal_port/SConscript'), variant_dir="hal_port", duplicate=0))
