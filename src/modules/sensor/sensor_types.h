@@ -378,7 +378,33 @@ typedef enum
     SENSOR_TEST_FAULT_TIMEOUT
 } sensor_test_fault_t;
 
+typedef enum
+{
+    SENSOR_IMU_TRIGGER_POLLING = 0, //按固定周期轮询IMU
+    SENSOR_IMU_TRIGGER_DRDY         //由PA31 DRDY唤醒，超时后轮询兜底
+} sensor_imu_trigger_mode_t;
 
+typedef struct
+{
+    sensor_imu_trigger_mode_t requested_mode; //调用者最近请求的模式
+    sensor_imu_trigger_mode_t active_mode;    //sensor线程实际生效的模式
+
+    rt_bool_t drdy_armed;   //器件INT1路由和MCU侧中断是否已准备就绪
+    rt_bool_t drdy_pending; //是否有尚未由sensor线程处理的DRDY通知
+
+    rt_uint32_t request_seq; //模式切换请求序号
+    rt_uint32_t applied_seq; //最近已处理的模式切换请求序号
+
+    rt_uint32_t drdy_sample_count; //由DRDY触发并成功取得的样本数
+    rt_uint32_t fallback_count;    //等待DRDY超时后执行轮询兜底的次数
+    rt_uint32_t coalesced_count;   //已有待处理通知时合并的新DRDY次数
+
+    rt_tick_t last_assert_tick;          //最近一次DRDY断言的系统tick
+    rt_tick_t last_read_start_tick;      //最近一次IMU读取开始的系统tick
+    rt_tick_t max_assert_to_read_ticks;  //DRDY断言到开始读取的最大tick差
+
+    rt_err_t last_switch_error; //最近一次模式切换的执行结果
+} sensor_imu_trigger_status_t;
 #ifdef __cplusplus
 }
 #endif

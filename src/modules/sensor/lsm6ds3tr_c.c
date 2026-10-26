@@ -45,20 +45,32 @@
 #define LSM6DS3TR_C_WARMUP_SAMPLE_COUNT      3U     // 采样前丢弃的样本数，避免刚上电时的异常值
 static rt_bool_t g_lsm6ds3tr_c_initialized = RT_FALSE;  //初始化状态仅由本驱动维护
 
+#define LSM6DS3TR_C_DRDY_PULSE_CFG_G_REG    0x0BU   // DRDY锁存或脉冲方式配置寄存器
+#define LSM6DS3TR_C_INT1_CTRL_REG           0x0DU   // INT1中断源路由寄存器
 
+#define LSM6DS3TR_C_DRDY_PULSED_MASK        0x80U   // bit7：0为锁存，1为脉冲
+#define LSM6DS3TR_C_INT1_DRDY_G_MASK        0x02U   // bit1：将陀螺仪DRDY路由到INT1
+#define LSM6DS3TR_C_INT1_DRDY_XL_MASK       0x01U   // bit0：将加速度DRDY路由到INT1
+
+#define LSM6DS3TR_C_H_LACTIVE_MASK          0x20U   // CTRL3_C bit5：0为高电平有效，1为低电平有效
+#define LSM6DS3TR_C_PP_OD_MASK              0x10U   // CTRL3_C bit4：0为推挽，1为开漏
+#define LSM6DS3TR_C_DRDY_OUTPUT_MASK        0x30U   // 同时检查或清除上述极性和输出方式位
 
 
 
 //公开函数声明
 rt_err_t lsm6ds3tr_c_read_id(rt_uint8_t device_address,
-                             rt_uint8_t *who_am_i);         // 读取LSM6DS3TR-C的WHO_AM_I寄存器值
+                             rt_uint8_t *who_am_i);                     //读取LSM6DS3TR-C的WHO_AM_I寄存器值
 rt_err_t lsm6ds3tr_c_init(lsm6ds3tr_c_config_readback_t *readback);     //初始化LSM6DS3TR-C，读取关键寄存器值并保存到readback结构体
 rt_err_t lsm6ds3tr_c_read_sample(sensor_imu_sample_t *sample);          //读取LSM6DS3TR-C的陀螺仪和加速度计采样数据
+rt_err_t lsm6ds3tr_c_configure_drdy(rt_bool_t enable,
+                            lsm6ds3tr_c_drdy_readback_t *readback);     //开启或关闭LSM6DS3TR-C的INT1 DRDY路由并验证读回值
 //私有函数声明
 static rt_int16_t lsm6ds3tr_c_decode_i16(rt_uint8_t low,rt_uint8_t high); /* 将低字节和高字节解码为16位有符号原始值。 */
 static rt_err_t lsm6ds3tr_c_wait_reset_complete(void);                    /* 有限等待软件复位位自动清零。 */
 static rt_err_t lsm6ds3tr_c_wait_data_ready(void);                        /* 有限等待加速度和陀螺仪数据同时就绪。 */
 static rt_err_t lsm6ds3tr_c_discard_warmup_samples(void);                 /* 丢弃上电后的异常样本。 */
+static void lsm6ds3tr_c_disable_drdy_route_best_effort(void);
 //---------------------------------------------------------------公开函数---------------------------------------------------------------
 /*
  * 简介：复位LSM6DS3TR-C，写入任务5冻结配置并验证实际读回值。
@@ -335,6 +347,240 @@ rt_err_t lsm6ds3tr_c_read_sample(sensor_imu_sample_t *sample)
 
     return RT_EOK;
 }
+
+/*
+ * 简介：开启或关闭LSM6DS3TR-C的INT1 DRDY路由并验证读回值。
+ * 输入：enable为RT_TRUE时启用XL DRDY，为RT_FALSE时关闭DRDY；
+ *       readback为可选输出缓冲区，允许为RT_NULL。
+ * 返回值：成功返回RT_EOK；参数无效返回-RT_EINVAL；
+ *         驱动尚未初始化返回-RT_ENOSYS；
+ *         配置读回不匹配返回-RT_EIO；
+ *         总线失败返回底层实际错误。
+ * 说明：只能由sensor线程调用。
+ *       当前实物R57未贴装，因此固定使用锁存、高有效、推挽输出。
+ *       只路由XL DRDY，GY DRDY保持关闭。
+ *       失败时不修改调用者的readback。
+ */
+rt_err_t lsm6ds3tr_c_configure_drdy(rt_bool_t enable,lsm6ds3tr_c_drdy_readback_t *readback)
+{
+    lsm6ds3tr_c_drdy_readback_t actual = {0};
+    rt_uint8_t drdy_pulse_cfg_g;
+    rt_uint8_t int1_ctrl=0U;
+    rt_uint8_t ctrl3_c;
+    rt_uint8_t expected_int1;
+    rt_err_t result;
+
+    if ((enable != RT_TRUE) && (enable != RT_FALSE))
+    {
+        return -RT_EINVAL;
+    }
+
+    if (g_lsm6ds3tr_c_initialized == RT_FALSE)
+    {
+        return -RT_ENOSYS;
+    }
+
+    /*
+     * 先读取当前寄存器，后续使用读改写保存不相关功能位。
+     */
+    result = sensor_bus_port_read_reg(LSM6DS3TR_C_ADDRESS,
+                                        LSM6DS3TR_C_DRDY_PULSE_CFG_G_REG,
+                                        &drdy_pulse_cfg_g,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    result = sensor_bus_port_read_reg(LSM6DS3TR_C_ADDRESS,
+                                        LSM6DS3TR_C_CTRL3_C_REG,
+                                        &ctrl3_c,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    /*
+     * 关闭DRDY时先移除INT1路由，
+     * 避免后续处理电气配置时继续产生GPIO中断。
+     */
+    if (enable == RT_FALSE)
+    {
+        int1_ctrl = 0U;
+
+        result = sensor_bus_port_write_reg(LSM6DS3TR_C_ADDRESS,
+                                            LSM6DS3TR_C_INT1_CTRL_REG,
+                                            &int1_ctrl,
+                                            1U);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+    }
+
+    /*
+     * DRDY_PULSED=0：使用锁存模式。
+     * DRDY保持有效，直到输出寄存器被读取。
+     */
+    drdy_pulse_cfg_g &=(rt_uint8_t)(~LSM6DS3TR_C_DRDY_PULSED_MASK);
+
+    result = sensor_bus_port_write_reg(LSM6DS3TR_C_ADDRESS,
+                                        LSM6DS3TR_C_DRDY_PULSE_CFG_G_REG,
+                                        &drdy_pulse_cfg_g,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    /*
+     * 实物R57未贴装，不能依赖外部上拉。
+     * 清除H_LACTIVE和PP_OD，固定为高有效推挽输出。
+     *
+     * 该操作不会改变BDU、IF_INC、BLE或其他不相关位。
+     */
+    ctrl3_c &=(rt_uint8_t)(~LSM6DS3TR_C_DRDY_OUTPUT_MASK);
+
+    result = sensor_bus_port_write_reg(LSM6DS3TR_C_ADDRESS,
+                                        LSM6DS3TR_C_CTRL3_C_REG,
+                                        &ctrl3_c,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    /*
+     * 启用时最后才建立INT1路由。
+     * 只使用XL DRDY，避免两个DRDY源经过OR后导致边沿语义不清。
+     */
+    if (enable == RT_TRUE)
+    {
+        /*
+        * INT1由任务11独占，只路由XL DRDY。
+        * bit1=0关闭GY DRDY，bit0=1开启XL DRDY。
+        */
+        int1_ctrl = LSM6DS3TR_C_INT1_DRDY_XL_MASK;
+
+        result = sensor_bus_port_write_reg(LSM6DS3TR_C_ADDRESS,
+                                            LSM6DS3TR_C_INT1_CTRL_REG,
+                                            &int1_ctrl,
+                                            1U);
+        if (result != RT_EOK)
+        {
+            /*
+            * 写入可能已经部分生效，尽力恢复为无中断路由。
+            * 清理结果不能覆盖原始错误。
+            */
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+            return result;
+        }
+    }
+
+    /*
+     * 分别读回三个寄存器，验证器件实际状态。
+     */
+    result = sensor_bus_port_read_reg(LSM6DS3TR_C_ADDRESS,
+                                        LSM6DS3TR_C_DRDY_PULSE_CFG_G_REG,
+                                        &actual.drdy_pulse_cfg_g,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        if (enable == RT_TRUE)
+        {
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+        }
+        return result;
+    }
+
+    result = sensor_bus_port_read_reg(LSM6DS3TR_C_ADDRESS,
+                                        LSM6DS3TR_C_INT1_CTRL_REG,
+                                        &actual.int1_ctrl,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        if (enable == RT_TRUE)
+        {
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+        }
+        return result;
+    }
+
+    result = sensor_bus_port_read_reg(LSM6DS3TR_C_ADDRESS,
+                                        LSM6DS3TR_C_CTRL3_C_REG,
+                                        &actual.ctrl3_c,
+                                        1U);
+    if (result != RT_EOK)
+    {
+        if (enable == RT_TRUE)
+        {
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+        }
+        return result;
+    }
+
+    expected_int1 = (enable == RT_TRUE) ? LSM6DS3TR_C_INT1_DRDY_XL_MASK : 0U;
+
+    /*
+     * 锁存模式验证。
+     */
+    if ((actual.drdy_pulse_cfg_g & LSM6DS3TR_C_DRDY_PULSED_MASK) != 0U)
+    {
+        if (enable == RT_TRUE)
+        {
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+        }
+        return -RT_EIO;
+    }
+
+    /*
+     * 高有效推挽验证。
+     * 两个位都必须保持为0。
+     */
+    if ((actual.ctrl3_c & LSM6DS3TR_C_DRDY_OUTPUT_MASK) != 0U)
+    {
+        if (enable == RT_TRUE)
+        {
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+        }
+        return -RT_EIO;
+    }
+
+    /*
+     * 同时确认任务5冻结的BDU、IF_INC和字节序没有被破坏。
+     */
+    if (actual.ctrl3_c != LSM6DS3TR_C_CTRL3_C_VALUE)
+    {
+        if (enable == RT_TRUE)
+        {
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+        }
+        return -RT_EIO;
+    }
+
+    /*
+    * INT1_CTRL由任务11独占。
+    * 启用时必须严格等于0x01，关闭时必须严格等于0x00，
+    * 防止其他中断源混入DRDY统计。
+    */
+    if (actual.int1_ctrl != expected_int1)
+    {
+        if (enable == RT_TRUE)
+        {
+            lsm6ds3tr_c_disable_drdy_route_best_effort();
+        }
+
+        return -RT_EIO;
+    }
+
+    if (readback != RT_NULL)
+    {
+        *readback = actual;
+    }
+
+    return RT_EOK;
+}
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 /*
  * 简介：把低字节在前的两个无符号字节解析为16位有符号补码。
@@ -496,4 +742,22 @@ static rt_err_t lsm6ds3tr_c_discard_warmup_samples(void)
     }
 
     return RT_EOK;
+}
+/*
+ * 简介：尽力关闭LSM6DS3TR-C全部INT1中断路由。
+ * 输入：无。
+ * 返回值：无。
+ * 说明：仅用于DRDY配置失败后的收尾。
+ *       本函数不打印日志，也不覆盖调用者准备返回的原始错误。
+ *       即使本次清理失败，上层仍会关闭MCU侧PA31中断。
+ */
+static void lsm6ds3tr_c_disable_drdy_route_best_effort(void)
+{
+    rt_uint8_t int1_ctrl = 0U;
+
+    (void)sensor_bus_port_write_reg(
+        LSM6DS3TR_C_ADDRESS,
+        LSM6DS3TR_C_INT1_CTRL_REG,
+        &int1_ctrl,
+        1U);
 }

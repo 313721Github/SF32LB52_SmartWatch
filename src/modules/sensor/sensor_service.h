@@ -32,7 +32,9 @@ rt_err_t sensor_service_request_probe(rt_uint32_t device_mask);                 
 
 rt_err_t sensor_service_test_inject(sensor_device_id_t device,sensor_test_fault_t fault,
                                                                         rt_uint32_t count); //配置固定次数的软件故障注入
+rt_err_t sensor_service_request_imu_trigger_mode(sensor_imu_trigger_mode_t mode);           //提交模式切换请求，由sensor线程执行
 
+rt_err_t sensor_service_get_imu_trigger_status(sensor_imu_trigger_status_t *status);        //复制当前触发模式及DRDY统计
 #ifdef __cplusplus
 }
 #endif

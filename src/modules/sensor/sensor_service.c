@@ -4,7 +4,7 @@
 #include "lsm6ds3tr_c.h"
 #include "mmc5603nj.h"
 #include "ltr303als01.h"
-
+#include "sensor_drdy_port.h"
 #include <string.h>
 /*
  * sensor服务内部配置
@@ -59,10 +59,23 @@
  * event只负责唤醒sensor线程。
  * 请求的参数保存在受保护的标量变量中，不通过event传递指针。
  */
-#define SENSOR_SERVICE_EVENT_PROBE       (1UL << 0)         //存在器件重探请求
-#define SENSOR_SERVICE_EVENT_CONTROL     (1UL << 1)         //故障注入等控制配置发生变化
-#define SENSOR_SERVICE_EVENT_ALL         (SENSOR_SERVICE_EVENT_PROBE | SENSOR_SERVICE_EVENT_CONTROL)
+#define SENSOR_SERVICE_EVENT_PROBE       (1UL << 0) //唤醒sensor线程处理器件重探请求
+#define SENSOR_SERVICE_EVENT_CONTROL     (1UL << 1) //唤醒sensor线程处理故障注入等控制请求
+#define SENSOR_SERVICE_EVENT_IMU_MODE    (1UL << 2) //唤醒sensor线程处理IMU触发模式切换
+#define SENSOR_SERVICE_EVENT_IMU_DRDY    (1UL << 3) //PA31 DRDY断言时唤醒sensor线程读取IMU
 
+#define SENSOR_SERVICE_EVENT_ALL         \
+    (SENSOR_SERVICE_EVENT_PROBE    |     \
+     SENSOR_SERVICE_EVENT_CONTROL  |     \
+     SENSOR_SERVICE_EVENT_IMU_MODE |     \
+     SENSOR_SERVICE_EVENT_IMU_DRDY)       //sensor线程等待的全部事件位
+
+/*
+ * DRDY模式下，如果连续60 ms没有收到有效中断，sensor线程主动执行一次状态检查和读取。
+ *
+ * 当前IMU ODR约52 Hz，一个周期约19.23 ms；60 ms约覆盖三个ODR周期，既能避免短暂调度抖动误触发，又能在中断遗漏时保持有界恢复。
+ */
+#define SENSOR_SERVICE_IMU_DRDY_FALLBACK_MS       60U
 
 // sensor服务生命周期状态
 typedef enum
@@ -166,6 +179,12 @@ typedef struct
     sensor_snapshot_t snapshot;
     sensor_service_stats_t stats;
 
+    //切换imu工作模式
+    sensor_imu_trigger_status_t imu_trigger; //对外可复制的模式状态与累计统计
+
+    rt_bool_t imu_drdy_pending;              //ISR已通知、sensor线程尚未处理的DRDY
+    rt_tick_t imu_drdy_assert_tick;           //待处理DRDY的断言时间
+    rt_tick_t imu_drdy_fallback_due_tick;     //等待DRDY的绝对兜底期限
 } sensor_service_context_t;
 
 //定义唯一服务实例
@@ -200,6 +219,8 @@ rt_err_t sensor_service_get_stats(sensor_service_stats_t *stats);   //复制统�
 rt_err_t sensor_service_request_probe(rt_uint32_t device_mask);     //请求sensor线程重探指定器件
 
 rt_err_t sensor_service_test_inject(sensor_device_id_t device,sensor_test_fault_t fault,rt_uint32_t count);//为指定器件配置固定次数的软件故障注入
+rt_err_t sensor_service_request_imu_trigger_mode(sensor_imu_trigger_mode_t mode);                          //异步请求切换IMU轮询或DRDY模式
+rt_err_t sensor_service_get_imu_trigger_status(sensor_imu_trigger_status_t *status);                       //复制IMU触发模式、DRDY状态和累计统计
 
 //私有函数声明
 static void sensor_service_thread_entry(void *parameter);
@@ -260,6 +281,12 @@ static void sensor_service_record_wake(void);                   //记录sensor�
 
 static rt_tick_t sensor_service_calculate_wait(rt_tick_t now);  //计算sensor线程下一次event等待允许持续的tick数
 static void sensor_service_record_retry(sensor_device_id_t device);  //记录TEMP_FAILED退避到期后真正开始的一次受控重试
+//imu模式切换
+static rt_err_t sensor_service_imu_drdy_callback(rt_tick_t assert_tick,
+                                                    void *user_data); //PA31 ISR回调：记录断言时间并唤醒sensor线程
+static rt_err_t sensor_service_enable_imu_drdy(void);   //在sensor线程中配置并启用IMU DRDY触发
+static rt_err_t sensor_service_disable_imu_drdy(void);  //在sensor线程中禁用PA31中断并关闭INT1路由
+static void sensor_service_apply_imu_mode_request(void); //由sensor线程执行待处理的触发模式切换请求
 //---------------------------------------------------------------公开函数---------------------------------------------------------------
 /*
  * 简介：注册sensor服务的快照或状态变化通知回调。
@@ -354,7 +381,17 @@ rt_err_t sensor_service_init(void)
     g_sensor_service.pending_probe_mask = 0U;
     g_sensor_service.lock_timeout_count = 0U;
     g_sensor_service.probe_request_count = 0U;
+    /* 每次创建服务资源前，明确恢复已验收的轮询模式。 */
+    memset(&g_sensor_service.imu_trigger,0,sizeof(g_sensor_service.imu_trigger));
 
+    g_sensor_service.imu_trigger.requested_mode =SENSOR_IMU_TRIGGER_POLLING;
+    g_sensor_service.imu_trigger.active_mode =SENSOR_IMU_TRIGGER_POLLING;
+    g_sensor_service.imu_trigger.drdy_armed = RT_FALSE;
+    g_sensor_service.imu_trigger.last_switch_error = RT_EOK;
+
+    g_sensor_service.imu_drdy_pending = RT_FALSE;
+    g_sensor_service.imu_drdy_assert_tick = 0U;
+    g_sensor_service.imu_drdy_fallback_due_tick = 0U;
     rt_hw_interrupt_enable(level);
 
     now = rt_tick_get();
@@ -838,6 +875,84 @@ rt_err_t sensor_service_test_inject(sensor_device_id_t device,sensor_test_fault_
      */
     return rt_event_send(wake_event,SENSOR_SERVICE_EVENT_CONTROL);
 }
+
+/*
+ * 简介：异步请求切换IMU轮询或DRDY模式。
+ * 输入：mode为目标模式。
+ * 返回值：请求提交成功返回RT_EOK；
+ *         模式无效返回-RT_EINVAL；
+ *         服务未运行返回-RT_ENOSYS；
+ *         event发送失败返回实际错误。
+ * 说明：本函数不执行I2C或GPIO配置，只提交标量请求。
+ */
+rt_err_t sensor_service_request_imu_trigger_mode(sensor_imu_trigger_mode_t mode)
+{
+    rt_event_t wake_event;
+    rt_base_t level;
+
+    if ((mode != SENSOR_IMU_TRIGGER_POLLING) &&(mode != SENSOR_IMU_TRIGGER_DRDY))
+    {
+        return -RT_EINVAL;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    if ((g_sensor_service.state !=SENSOR_SERVICE_STATE_RUNNING) ||
+        (g_sensor_service.wake_event == RT_NULL))
+    {
+        rt_hw_interrupt_enable(level);
+        return -RT_ENOSYS;
+    }
+
+    g_sensor_service.imu_trigger.requested_mode = mode;
+    g_sensor_service.imu_trigger.request_seq++;
+
+    wake_event = g_sensor_service.wake_event;
+
+    rt_hw_interrupt_enable(level);
+
+    return rt_event_send(wake_event,SENSOR_SERVICE_EVENT_IMU_MODE);
+}
+
+/*
+ * 简介：复制IMU触发模式、DRDY状态和累计统计。
+ * 输入：status为调用者输出缓冲区。
+ * 返回值：成功返回RT_EOK；空指针返回-RT_EINVAL；
+ *         服务未运行返回-RT_ENOSYS。
+ * 说明：在短临界区内整体复制，不返回内部状态指针。
+ */
+rt_err_t sensor_service_get_imu_trigger_status(sensor_imu_trigger_status_t *status)
+{
+    sensor_imu_trigger_status_t candidate;
+    rt_base_t level;
+
+    if (status == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    if (g_sensor_service.state !=SENSOR_SERVICE_STATE_RUNNING)
+    {
+        rt_hw_interrupt_enable(level);
+        return -RT_ENOSYS;
+    }
+
+    candidate = g_sensor_service.imu_trigger;
+
+    /*
+     * 内部pending是调度使用的权威值。
+     * 对外副本在同一临界区内取得它。
+     */
+    candidate.drdy_pending =g_sensor_service.imu_drdy_pending;
+
+    rt_hw_interrupt_enable(level);
+
+    *status = candidate;
+
+    return RT_EOK;
+}
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 /*
  * 简介：统一sensor线程入口，负责三器件初始化、调度、重探和通知。
@@ -877,7 +992,11 @@ static void sensor_service_thread_entry(void *parameter)
          * 真实I2C操作仍然只在sensor线程中执行。
          */
         sensor_service_process_probe_requests();
-
+        /*
+        * 模式切换可能涉及IMU寄存器和PA31配置，
+        * 因此只能由唯一sensor线程执行。
+        */
+        sensor_service_apply_imu_mode_request();
         /*
          * 分别推进三颗器件的调度状态机。
          * 每次重新读取tick，避免前一个器件的耗时影响时间判断。
@@ -1685,10 +1804,12 @@ static void sensor_service_advance_period(sensor_device_id_t device,rt_tick_t no
 static rt_err_t sensor_service_initialize_device(sensor_device_id_t device,rt_bool_t force)
 {
     sensor_device_runtime_t *runtime;
+    sensor_imu_trigger_mode_t requested_mode;
     rt_tick_t start_tick;
     rt_tick_t operation_ticks;
     rt_tick_t now;
     rt_err_t result;
+    rt_base_t level;
 
     lsm6ds3tr_c_config_readback_t imu_readback = {0};
     ltr303als01_config_readback_t als_readback = {0};
@@ -1700,7 +1821,22 @@ static rt_err_t sensor_service_initialize_device(sensor_device_id_t device,rt_bo
     }
 
     runtime = &g_sensor_service.runtime[device];
+    if ((device == SENSOR_DEVICE_IMU) &&(sensor_drdy_port_is_enabled() == RT_TRUE))
+    {
+        (void)sensor_drdy_port_disable();
 
+        level = rt_hw_interrupt_disable();
+
+        g_sensor_service.imu_trigger.active_mode =SENSOR_IMU_TRIGGER_POLLING;
+
+        g_sensor_service.imu_trigger.drdy_armed =RT_FALSE;
+
+        g_sensor_service.imu_trigger.drdy_pending =RT_FALSE;
+
+        g_sensor_service.imu_drdy_pending =RT_FALSE;
+
+        rt_hw_interrupt_enable(level);
+    }
     /*
      * 每次完整初始化事务最多消费一次故障注入。
      * 注入生效时不再进入真实总线和器件初始化路径。
@@ -1773,7 +1909,30 @@ static rt_err_t sensor_service_initialize_device(sensor_device_id_t device,rt_bo
 
     runtime->configured = RT_TRUE;
     runtime->wait_phase = SENSOR_WAIT_PHASE_IDLE;
+    /*
+    * IMU恢复初始化可能覆盖或清除INT1相关配置。
+    * 如果调用者仍请求DRDY，则重新建立器件路由和GPIO中断。
+    *
+    * DRDY重新挂接失败不否定IMU基础初始化结果：
+    * 服务继续使用轮询，并通过last_switch_error暴露失败。
+    */
+    level = rt_hw_interrupt_disable();
 
+    requested_mode =g_sensor_service.imu_trigger.requested_mode;
+
+    rt_hw_interrupt_enable(level);
+    if ((device == SENSOR_DEVICE_IMU) &&(requested_mode ==SENSOR_IMU_TRIGGER_DRDY))
+    {
+        rt_err_t drdy_result;
+
+        drdy_result = sensor_service_enable_imu_drdy();
+
+        level = rt_hw_interrupt_disable();
+
+        g_sensor_service.imu_trigger.last_switch_error =drdy_result;
+
+        rt_hw_interrupt_enable(level);
+    }
     /*
      * 失败或离线后的初始化成功仍处于恢复过程。
      * 第一份完整有效样本提交后才清除此标志。
@@ -1972,23 +2131,87 @@ static void sensor_service_process_imu(rt_tick_t now)
 {
     sensor_device_runtime_t *runtime;
     sensor_imu_sample_t sample = {0};
+    sensor_imu_trigger_mode_t requested_mode;
 
     rt_tick_t start_tick;
     rt_tick_t operation_ticks;
     rt_err_t result;
 
+    rt_bool_t drdy_triggered;       //ISR已通知、sensor线程尚未处理的DRDY
+    rt_bool_t fallback_triggered;
+    rt_bool_t recovery_attempt;
+    rt_bool_t drdy_active;
+    rt_bool_t drdy_armed;
+
+    rt_tick_t drdy_assert_tick;
+    rt_tick_t assert_to_read_ticks;
+    rt_base_t level;
     runtime =&g_sensor_service.runtime[SENSOR_DEVICE_IMU];
 
-    /*
-     * 未到采样或重试期限、尚未配置或恢复初始化失败时，
-     * 本轮不访问IMU。
-     */
-    if (sensor_service_prepare_device(SENSOR_DEVICE_IMU,now) == RT_FALSE)
-    {
-        return;
-    }
+    drdy_triggered = RT_FALSE;
+    fallback_triggered = RT_FALSE;
+    drdy_assert_tick = 0U;
+
+    recovery_attempt = runtime->recovery_pending;
 
     /*
+    * active_mode和armed可能在ISR相关临界区中更新，
+    * 先取得同一观察时刻的副本。
+    */
+    level = rt_hw_interrupt_disable();
+
+    drdy_active =(g_sensor_service.imu_trigger.active_mode ==SENSOR_IMU_TRIGGER_DRDY)? RT_TRUE: RT_FALSE;
+
+    drdy_armed =g_sensor_service.imu_trigger.drdy_armed;
+
+    rt_hw_interrupt_enable(level);
+
+    /*
+    * READY且DRDY真正生效时，不再使用20 ms next_due_tick决定采样。
+    * 只响应硬件DRDY或60 ms超时兜底。
+    *
+    * TEMP_FAILED、OFFLINE、未初始化和DRDY未挂接时，
+    * 继续使用任务8原有prepare_device()恢复路径。
+    */
+    if ((runtime->state == SENSOR_DEVICE_STATE_READY) &&
+        (runtime->configured == RT_TRUE) &&
+        (drdy_active == RT_TRUE) &&
+        (drdy_armed == RT_TRUE))
+    {
+        level = rt_hw_interrupt_disable();
+
+        //判断DRDY模式下，ISR是否已通知
+        if (g_sensor_service.imu_drdy_pending == RT_TRUE)
+        {
+            drdy_triggered = RT_TRUE;
+
+            drdy_assert_tick =g_sensor_service.imu_drdy_assert_tick;
+
+            g_sensor_service.imu_drdy_pending =RT_FALSE;
+
+            g_sensor_service.imu_trigger.drdy_pending =RT_FALSE;
+        }
+
+        rt_hw_interrupt_enable(level);
+
+        if (drdy_triggered == RT_FALSE)
+        {
+            if (sensor_service_tick_reached(now,g_sensor_service.imu_drdy_fallback_due_tick)== RT_FALSE)
+            {
+                return;
+            }
+
+            fallback_triggered = RT_TRUE;
+        }
+    }
+    else
+    {
+        if (sensor_service_prepare_device(SENSOR_DEVICE_IMU,now) == RT_FALSE)
+        {
+            return;
+        }
+    }
+     /*
      * 一次IMU高层读取最多消费一次故障注入。
      * 注入生效时不会进入真实驱动读取。
      */
@@ -1998,34 +2221,112 @@ static void sensor_service_process_imu(rt_tick_t now)
 
     if (result == RT_EOK)
     {
+        /*
+        * 只有即将真正调用驱动时，才记录读取开始时间和
+        * DRDY断言到读取开始的响应延迟。
+        */
+        level = rt_hw_interrupt_disable();
+
+        g_sensor_service.imu_trigger.last_read_start_tick =start_tick;
+
+        //处于DRDY模式时进行imu工作模式记录
+        if (drdy_triggered == RT_TRUE)
+        {
+            assert_to_read_ticks = (rt_tick_t)(start_tick - drdy_assert_tick);
+
+            if (assert_to_read_ticks >g_sensor_service.imu_trigger.max_assert_to_read_ticks)
+            {
+                g_sensor_service.imu_trigger.max_assert_to_read_ticks =assert_to_read_ticks;
+            }
+        }
+
+        rt_hw_interrupt_enable(level);
+
         result = lsm6ds3tr_c_read_sample(&sample);
     }
 
-    /* 记录本次实际驱动读取或注入错误路径的执行耗时。 */
+    /* 记录本次实际驱动读取或注入错误路径的执行耗时 */
     operation_ticks =(rt_tick_t)(rt_tick_get() - start_tick);
-
     /*
-     * 只有返回成功且驱动明确标记样本有效时，
-     * 才允许发布完整IMU快照和增加器件样本序号。
-     */
+    * fallback_count表示兜底调度实际被执行，
+    * 即使本次随后被软件故障注入拦截，也应保留该次数。
+    */
+    if (fallback_triggered == RT_TRUE)
+    {
+        level = rt_hw_interrupt_disable();
+
+        g_sensor_service.imu_trigger.fallback_count++;
+
+        rt_hw_interrupt_enable(level);
+    }
+
     if ((result == RT_EOK) &&(sample.valid == RT_TRUE))
     {
-        (void)sensor_service_commit_sample(
-            SENSOR_DEVICE_IMU,
-            &sample,
-            operation_ticks);
+        recovery_attempt = runtime->recovery_pending;
+
+        (void)sensor_service_commit_sample(SENSOR_DEVICE_IMU,
+                                            &sample,
+                                            operation_ticks);
+
+        level = rt_hw_interrupt_disable();
+
+        drdy_active =(g_sensor_service.imu_trigger.active_mode ==SENSOR_IMU_TRIGGER_DRDY)
+                    ? RT_TRUE
+                    : RT_FALSE;
+
+        drdy_armed = g_sensor_service.imu_trigger.drdy_armed;
+
+        if (drdy_triggered == RT_TRUE)
+        {
+            g_sensor_service.imu_trigger.drdy_sample_count++;
+        }
+
+        if ((drdy_active == RT_TRUE) &&(drdy_armed == RT_TRUE))
+        {
+            /*
+            * DRDY模式不推进20 ms软件周期。
+            * 下一次正常采样由新DRDY决定，只更新丢中断兜底期限。
+            */
+            g_sensor_service.imu_drdy_fallback_due_tick =rt_tick_get() + sensor_service_ms_to_tick(SENSOR_SERVICE_IMU_DRDY_FALLBACK_MS);
+        }
+
+        rt_hw_interrupt_enable(level);
+
+        if ((drdy_active == RT_FALSE) ||(drdy_armed == RT_FALSE))
+        {
+            /*
+            * 轮询或失败恢复期间仍使用原来的绝对周期调度。
+            */
+            sensor_service_advance_period(SENSOR_DEVICE_IMU,rt_tick_get());
+        }
 
         /*
-         * 无论通知消费者是否及时读取，都按照绝对周期
-         * 推进下一期限，避免围绕当前样本重复采集。
-         */
-        sensor_service_advance_period(
-            SENSOR_DEVICE_IMU,
-            rt_tick_get());
+        * DRDY模式发生读取错误后会临时关闭GPIO中断并回到轮询。
+        * 恢复后的第一份完整样本成功提交后，才尝试重新启用DRDY。
+        */
+        level = rt_hw_interrupt_disable();
+
+        requested_mode =g_sensor_service.imu_trigger.requested_mode;
+
+        rt_hw_interrupt_enable(level);
+
+        if ((recovery_attempt == RT_TRUE) &&
+            (requested_mode  ==SENSOR_IMU_TRIGGER_DRDY) &&
+            (g_sensor_service.imu_trigger.drdy_armed ==RT_FALSE))
+        {
+            rt_err_t drdy_result;
+
+            drdy_result =sensor_service_enable_imu_drdy();
+
+            level = rt_hw_interrupt_disable();
+
+            g_sensor_service.imu_trigger.last_switch_error = drdy_result;
+
+            rt_hw_interrupt_enable(level);
+        }
 
         return;
     }
-
     /*
      * -RT_EBUSY表示当前尚无新数据，属于正常调度现象，
      * 不增加failure、timeout或连续失败次数。
@@ -2033,8 +2334,15 @@ static void sensor_service_process_imu(rt_tick_t now)
     if (result == -RT_EBUSY)
     {
         sensor_service_record_not_ready(SENSOR_DEVICE_IMU,operation_ticks);
-
-        if ((runtime->state ==SENSOR_DEVICE_STATE_TEMP_FAILED) ||
+        if ((drdy_active == RT_TRUE) &&(drdy_armed == RT_TRUE))
+        {
+            /*
+            * 已消费的DRDY不立即重新排队，避免高电平或异常状态
+            * 导致紧密循环。一个IMU周期后通过兜底路径再检查。
+            */
+            g_sensor_service.imu_drdy_fallback_due_tick =rt_tick_get() +runtime->period_ticks;
+        }
+        else if ((runtime->state ==SENSOR_DEVICE_STATE_TEMP_FAILED) ||
             (runtime->state ==SENSOR_DEVICE_STATE_OFFLINE))
         {
             /*
@@ -2063,7 +2371,33 @@ static void sensor_service_process_imu(rt_tick_t now)
     {
         result = -RT_EIO;
     }
+    /*
+    * 发生真正读取错误时先关闭MCU侧中断，避免退避期间继续产生
+    * DRDY唤醒风暴。
+    *
+    * 此处不追加I2C关闭INT1操作，因为当前错误本身可能来自总线，
+    * 再增加一次寄存器访问只会扩大失败路径。
+    */
+    if ((drdy_active == RT_TRUE) || (drdy_armed == RT_TRUE))
+    {
+        (void)sensor_drdy_port_disable();
 
+        level = rt_hw_interrupt_disable();
+
+        g_sensor_service.imu_trigger.active_mode =SENSOR_IMU_TRIGGER_POLLING;
+
+        g_sensor_service.imu_trigger.drdy_armed =RT_FALSE;
+
+        g_sensor_service.imu_trigger.drdy_pending =RT_FALSE;
+
+        g_sensor_service.imu_drdy_pending = RT_FALSE;
+
+        g_sensor_service.imu_drdy_assert_tick =0U;
+
+        g_sensor_service.imu_drdy_fallback_due_tick =0U;
+
+        rt_hw_interrupt_enable(level);
+    }
     /*
      * 真实驱动错误、注入错误和无效样本都进入统一失败路径，
      * 由连续失败阈值决定暂时失败或离线退避。
@@ -2609,8 +2943,9 @@ static void sensor_service_record_wake(void)
  * 输入：now为本轮处理结束、准备进入event等待时的当前tick。
  * 返回值：距离最近调度期限的等待tick数，最小返回1 tick。
  * 说明：分别检查三颗器件的ready轮询、失败重试和正常采样期限，
- *       选择最早到期者；最长睡眠限制为IMU的20 ms周期。
- *       event仍可因重探或控制请求提前唤醒线程。
+ *       选择最早到期者。
+ *       轮询模式最长等待约20 ms；
+ *       DRDY模式由中断提前唤醒，最长等待受60 ms兜底期限约束。
  */
 static rt_tick_t sensor_service_calculate_wait(rt_tick_t now)
 {
@@ -2619,12 +2954,34 @@ static rt_tick_t sensor_service_calculate_wait(rt_tick_t now)
     rt_tick_t delta;
     rt_uint32_t index;
 
-    /*
-     * 先将最长睡眠限制为IMU正常周期。
-     * 即使当前只有ALS等慢速器件可用，线程也不会一次睡眠超过
-     * 约20 ms；event请求仍然可以提前结束等待。
-     */
-    wait_ticks =sensor_service_ms_to_tick(SENSOR_SERVICE_IMU_PERIOD_MS);
+    rt_bool_t imu_drdy_active;
+    rt_bool_t imu_drdy_armed;
+    rt_bool_t imu_drdy_pending;
+    rt_tick_t imu_drdy_fallback_due;
+    rt_base_t level;
+
+    level = rt_hw_interrupt_disable();
+
+    imu_drdy_active =(g_sensor_service.imu_trigger.active_mode ==SENSOR_IMU_TRIGGER_DRDY)? RT_TRUE: RT_FALSE;
+
+    imu_drdy_armed = g_sensor_service.imu_trigger.drdy_armed;
+
+    imu_drdy_pending = g_sensor_service.imu_drdy_pending;
+
+    imu_drdy_fallback_due =g_sensor_service.imu_drdy_fallback_due_tick;
+
+    rt_hw_interrupt_enable(level);
+
+    if ((imu_drdy_active == RT_TRUE) &&(imu_drdy_armed == RT_TRUE))
+    {
+        // DRDY模式由中断提前唤醒，最长等待不超过兜底期限
+        wait_ticks = sensor_service_ms_to_tick(SENSOR_SERVICE_IMU_DRDY_FALLBACK_MS);
+    }
+    else
+    {
+        // 轮询模式按IMU常规采样周期限制最长等待
+        wait_ticks = sensor_service_ms_to_tick(SENSOR_SERVICE_IMU_PERIOD_MS);
+    }
 
     /*
      * 每颗器件都有独立的runtime，因此分别选择它当前真正生效的
@@ -2634,42 +2991,29 @@ static rt_tick_t sensor_service_calculate_wait(rt_tick_t now)
     {
         sensor_device_runtime_t *runtime =&g_sensor_service.runtime[index];
 
-        if (runtime->wait_phase == SENSOR_WAIT_PHASE_READY)
+        if ((index == SENSOR_DEVICE_IMU) &&
+            (runtime->state == SENSOR_DEVICE_STATE_READY) &&
+            (runtime->configured == RT_TRUE) &&
+            (imu_drdy_active == RT_TRUE) &&
+            (imu_drdy_armed == RT_TRUE))
         {
-            /*
-             * 当前存在尚未完成的非阻塞采样事务。
-             *
-             * MMC：等待下一次Meas_m_done检查；
-             * ALS：等待下一次ALS_STATUS.NEW检查。
-             *
-             * WAIT_READY优先级最高，因为同一事务必须在
-             * ready_deadline_tick之前继续推进。
-             */
+            // DRDY待处理时尽快唤醒，否则等待超时兜底期限
+            deadline = (imu_drdy_pending == RT_TRUE) ? now : imu_drdy_fallback_due;
+        }
+        else if (runtime->wait_phase == SENSOR_WAIT_PHASE_READY)
+        {
+            // 非阻塞事务尚未完成，按下一次状态检查时间唤醒
             deadline = runtime->next_poll_tick;
         }
         else if ((runtime->state ==SENSOR_DEVICE_STATE_TEMP_FAILED) ||
-                 (runtime->state ==SENSOR_DEVICE_STATE_OFFLINE))
+                (runtime->state ==SENSOR_DEVICE_STATE_OFFLINE))
         {
-            /*
-             * 器件处于失败状态且当前没有等待中的采样事务。
-             *
-             * TEMP_FAILED使用约1秒的受控重试期限；
-             * OFFLINE使用约5秒的重探期限。
-             *
-             * 失败期间不能继续使用正常next_due_tick紧密访问总线。
-             */
+            // 失败或离线期间按退避期限重试
             deadline = runtime->retry_due_tick;
         }
         else
         {
-            /*
-             * 器件正常运行或正在等待首份有效样本时，
-             * 使用正常绝对采样期限。
-             *
-             * IMU：下一次状态检查和六轴burst期限；
-             * MMC：下一次单次测量触发期限；
-             * ALS：下一次进入NEW检查窗口的期限。
-             */
+            // 正常轮询按下一次计划采样时间唤醒
             deadline = runtime->next_due_tick;
         }
 
@@ -2739,4 +3083,400 @@ static void sensor_service_record_retry(sensor_device_id_t device)
     }
 
     (void)rt_mutex_release(g_sensor_service.snapshot_mutex);
+}
+
+/*
+ * 简介：接收PA31高电平DRDY断言并唤醒sensor线程。
+ * 输入：assert_tick为GPIO ISR观察到高电平的系统tick；user_data当前未使用。
+ * 返回值：通知成功或已被合并返回RT_EOK；
+ *         服务未运行返回-RT_ENOSYS；
+ *         event发送失败返回对应RT-Thread错误。
+ * 说明：
+ * 1. 本函数运行在GPIO ISR上下文；
+ * 2. 只更新固定长度标量并发送event；
+ * 3. 禁止I2C、日志、延时、mutex和LVGL操作；
+ * 4. 多次DRDY在前一次尚未处理时合并，不建立无限队列；
+ * 5. 内部保留最早一条待处理断言时间，用于计算最坏响应延迟。
+ */
+static rt_err_t sensor_service_imu_drdy_callback(rt_tick_t assert_tick,void *user_data)
+{
+    rt_event_t wake_event;
+    rt_bool_t need_wake;
+    rt_base_t level;
+
+    (void)user_data;
+
+    need_wake = RT_FALSE;
+    wake_event = RT_NULL;
+
+    level = rt_hw_interrupt_disable();
+
+    if ((g_sensor_service.state != SENSOR_SERVICE_STATE_RUNNING) ||
+        (g_sensor_service.wake_event == RT_NULL))
+    {
+        rt_hw_interrupt_enable(level);
+        return -RT_ENOSYS;
+    }
+
+    /*
+     * last_assert_tick记录最近一次硬件断言；
+     * imu_drdy_assert_tick保留最早一条尚未处理断言。
+     */
+    g_sensor_service.imu_trigger.last_assert_tick = assert_tick;
+
+    if (g_sensor_service.imu_drdy_pending == RT_FALSE)
+    {
+        g_sensor_service.imu_drdy_pending = RT_TRUE;
+        g_sensor_service.imu_drdy_assert_tick = assert_tick;
+        need_wake = RT_TRUE;
+    }
+    else
+    {
+        /*
+         * sensor线程尚未处理上一条通知时，新通知只计数并合并。
+         * 不能覆盖最早断言时间，否则会人为缩短响应延迟。
+         */
+        g_sensor_service.imu_trigger.coalesced_count++;
+    }
+
+    g_sensor_service.imu_trigger.drdy_pending =g_sensor_service.imu_drdy_pending;
+
+    wake_event = g_sensor_service.wake_event;
+
+    rt_hw_interrupt_enable(level);
+
+    /*
+     * 已存在待处理通知时不重复发送event。
+     * pending标志保证本次DRDY不会丢失。
+     */
+    if (need_wake == RT_FALSE)
+    {
+        return RT_EOK;
+    }
+
+    return rt_event_send(wake_event,SENSOR_SERVICE_EVENT_IMU_DRDY);
+}
+/*
+ * 简介：为已经完成初始化的IMU启用DRDY触发路径。
+ * 输入：无。
+ * 返回值：完整启用成功返回RT_EOK；端口、寄存器配置或电平读取失败时返回实际错误。
+ * 说明：
+ * 1. 只能由sensor线程调用；
+ * 2. PA31先保持中断关闭，再配置IMU INT1路由；
+ * 3. GPIO中断启用后再次读取PA31电平，补偿启用前已经锁存的DRDY；
+ * 4. 任一步失败都回退到轮询，不虚假声明DRDY已生效；
+ * 5. 不清零累计统计，统计清零留给后续显式测试命令。
+ */
+static rt_err_t sensor_service_enable_imu_drdy(void)
+{
+    lsm6ds3tr_c_drdy_readback_t readback = {0};
+    rt_uint8_t pin_level;
+    rt_tick_t now;
+    rt_err_t result;
+    rt_base_t level;
+
+    /*
+     * 先建立GPIO及ISR绑定，但初始化函数不会使能中断。
+     * 重复调用且回调一致时应保持幂等。
+     */
+    result = sensor_drdy_port_init(sensor_service_imu_drdy_callback, RT_NULL);
+
+    if (result != RT_EOK)
+    {
+        goto fail;
+    }
+
+    /*
+     * 防御性关闭GPIO中断，保证清理pending和配置器件期间
+     * ISR不会并发写入服务状态。
+     */
+    result = sensor_drdy_port_disable();
+    if (result != RT_EOK)
+    {
+        goto fail;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    g_sensor_service.imu_drdy_pending = RT_FALSE;
+    g_sensor_service.imu_drdy_assert_tick = 0U;
+    g_sensor_service.imu_trigger.drdy_pending = RT_FALSE;
+    g_sensor_service.imu_trigger.drdy_armed = RT_FALSE;
+
+    rt_hw_interrupt_enable(level);
+
+    /*
+     * 配置为高有效、推挽、锁存，且只把XL DRDY路由到INT1。
+     * 驱动内部必须完成写入、读回和完整匹配检查。
+     */
+    result = lsm6ds3tr_c_configure_drdy(RT_TRUE, &readback);
+
+    if (result != RT_EOK)
+    {
+
+        goto fail;
+    }
+
+    result = sensor_drdy_port_enable();
+    if (result != RT_EOK)
+    {
+        /*
+         * MCU侧中断无法启用时，尽量撤销器件INT1路由。
+         * 清理失败不能覆盖最初的端口错误。
+         */
+        (void)lsm6ds3tr_c_configure_drdy(
+            RT_FALSE,
+            &readback);
+
+        goto fail;
+    }
+
+    /*
+     * GPIO中断启用前INT1可能已经处于锁存高电平，
+     * 此时不会再产生新的上升沿，所以必须主动读取一次。
+     */
+    result = sensor_drdy_port_get_level(&pin_level);
+    if (result != RT_EOK)
+    {
+        (void)sensor_drdy_port_disable();
+
+        (void)lsm6ds3tr_c_configure_drdy(
+            RT_FALSE,
+            &readback);
+
+        goto fail;
+    }
+
+    now = rt_tick_get();
+
+    level = rt_hw_interrupt_disable();
+
+    g_sensor_service.imu_trigger.active_mode =SENSOR_IMU_TRIGGER_DRDY;
+
+    g_sensor_service.imu_trigger.drdy_armed = RT_TRUE;
+
+    g_sensor_service.imu_drdy_fallback_due_tick =now + sensor_service_ms_to_tick(SENSOR_SERVICE_IMU_DRDY_FALLBACK_MS);
+
+    rt_hw_interrupt_enable(level);
+
+    /*
+     * 高电平表示启用中断之前已有一份数据等待处理。
+     * 主动提交一次软件通知，不能等待下一条硬件边沿。
+     *
+     * 这条通知不是GPIO ISR统计中的硬件边沿，因此不会增加
+     * sensor_drdy_port的assert_count。
+     */
+    if (pin_level != 0U)
+    {
+        result = sensor_service_imu_drdy_callback(now,RT_NULL);
+
+        if (result != RT_EOK)
+        {
+            (void)sensor_drdy_port_disable();
+            (void)lsm6ds3tr_c_configure_drdy(RT_FALSE,&readback);
+
+            level = rt_hw_interrupt_disable();
+
+            g_sensor_service.imu_trigger.active_mode =SENSOR_IMU_TRIGGER_POLLING;
+
+            g_sensor_service.imu_trigger.drdy_armed = RT_FALSE;
+            g_sensor_service.imu_drdy_pending = RT_FALSE;
+            g_sensor_service.imu_trigger.drdy_pending = RT_FALSE;
+            g_sensor_service.imu_drdy_assert_tick =0U;
+            g_sensor_service.imu_drdy_fallback_due_tick =0U;
+
+            rt_hw_interrupt_enable(level);
+
+            return result;
+        }
+    }
+
+    return RT_EOK;
+
+fail:
+    /*
+     * 无论失败发生在哪一层，对外实际模式都必须是POLLING。
+     * requested_mode保持不变，用于表示调用者原本请求了什么。
+     */
+    (void)sensor_drdy_port_disable();
+
+    level = rt_hw_interrupt_disable();
+
+    g_sensor_service.imu_trigger.active_mode = SENSOR_IMU_TRIGGER_POLLING;
+
+    g_sensor_service.imu_trigger.drdy_armed = RT_FALSE;
+    g_sensor_service.imu_trigger.drdy_pending = RT_FALSE;
+
+    g_sensor_service.imu_drdy_pending = RT_FALSE;
+    g_sensor_service.imu_drdy_assert_tick = 0U;
+    g_sensor_service.imu_drdy_fallback_due_tick = 0U;
+
+    rt_hw_interrupt_enable(level);
+
+    return result;
+}
+
+/*
+ * 简介：停止PA31中断并把IMU恢复为轮询模式。
+ * 输入：无。
+ * 返回值：全部操作成功返回RT_EOK；
+ *         否则返回第一个实际错误。
+ * 说明：
+ * 1. 先关闭MCU侧中断，再访问IMU寄存器；
+ * 2. 即使器件寄存器关闭失败，也必须停止MCU侧中断并回到轮询；
+ * 3. 不能因为清理失败继续宣称DRDY仍安全生效；
+ * 4. 本函数不解除GPIO回调，不提供虚假deinit。
+ */
+static rt_err_t sensor_service_disable_imu_drdy(void)
+{
+    lsm6ds3tr_c_drdy_readback_t readback = {0};
+    sensor_device_runtime_t *runtime;
+    rt_err_t first_error;
+    rt_err_t result;
+    rt_tick_t now;
+    rt_base_t level;
+
+    runtime = &g_sensor_service.runtime[SENSOR_DEVICE_IMU];
+
+    first_error = RT_EOK;
+
+    if (sensor_drdy_port_is_enabled() == RT_TRUE)
+    {
+        result = sensor_drdy_port_disable();
+
+        if (result != RT_EOK)
+        {
+            first_error = result;
+        }
+    }
+
+    /*
+     * 只有IMU冻结配置仍有效时才尝试关闭器件INT1路由。
+     * 器件已经离线时继续访问总线只会扩大故障路径。
+     */
+    if (runtime->configured == RT_TRUE)
+    {
+        result = lsm6ds3tr_c_configure_drdy(RT_FALSE,&readback);
+
+        if ((result != RT_EOK) &&(first_error == RT_EOK))
+        {
+            first_error = result;
+        }
+    }
+
+    now = rt_tick_get();
+
+    level = rt_hw_interrupt_disable();
+
+    g_sensor_service.imu_trigger.active_mode =SENSOR_IMU_TRIGGER_POLLING;
+
+    g_sensor_service.imu_trigger.drdy_armed = RT_FALSE;
+    g_sensor_service.imu_trigger.drdy_pending = RT_FALSE;
+
+    g_sensor_service.imu_drdy_pending = RT_FALSE;
+    g_sensor_service.imu_drdy_assert_tick = 0U;
+    g_sensor_service.imu_drdy_fallback_due_tick = 0U;
+
+    rt_hw_interrupt_enable(level);
+
+    /*
+     * 从当前时刻重新建立轮询期限。
+     * 不沿用可能已经过期的旧期限，否则会形成立即补采。
+     */
+    runtime->next_due_tick =now + runtime->period_ticks;
+
+    return first_error;
+}
+
+/*
+ * 简介：由sensor线程执行最近一次IMU触发模式请求。
+ * 输入：无。
+ * 返回值：无；执行结果保存在imu_trigger状态中。
+ * 说明：
+ * 1. request_seq等于applied_seq时没有新请求；
+ * 2. 模式请求可能在I2C操作期间被新请求覆盖；
+ * 3. applied_seq只能更新为本次实际处理的请求序号；
+ * 4. 如果处理期间出现更新，下轮会继续处理新序号；
+ * 5. 外部线程不能直接执行GPIO或I2C操作。
+ */
+static void sensor_service_apply_imu_mode_request(void)
+{
+    sensor_imu_trigger_mode_t requested_mode;
+    sensor_device_runtime_t *runtime;
+    rt_uint32_t request_seq;
+    rt_err_t result;
+    rt_base_t level;
+
+    runtime = &g_sensor_service.runtime[SENSOR_DEVICE_IMU];
+
+    level = rt_hw_interrupt_disable();
+
+    request_seq = g_sensor_service.imu_trigger.request_seq;
+
+    if (request_seq ==g_sensor_service.imu_trigger.applied_seq)
+    {
+        rt_hw_interrupt_enable(level);
+        return;
+    }
+
+    requested_mode = g_sensor_service.imu_trigger.requested_mode;
+
+    rt_hw_interrupt_enable(level);
+
+    if (requested_mode == SENSOR_IMU_TRIGGER_DRDY)
+    {
+        /*
+         * 未完成身份与冻结配置时不能启用INT1。
+         * requested_mode仍保留DRDY，恢复初始化成功后可以重新挂接。
+         */
+        if ((runtime->configured == RT_FALSE)||
+            (runtime->state == SENSOR_DEVICE_STATE_TEMP_FAILED) ||
+            (runtime->state == SENSOR_DEVICE_STATE_OFFLINE))
+        {
+            result = -RT_EBUSY;
+        }
+        else if ((g_sensor_service.imu_trigger.active_mode ==SENSOR_IMU_TRIGGER_DRDY) &&
+                    (g_sensor_service.imu_trigger.drdy_armed ==RT_TRUE) &&
+                    (sensor_drdy_port_is_enabled() == RT_TRUE))
+        {
+            /*
+            * DRDY已经完整生效，重复请求直接成功。
+            * 不重复写寄存器或重新注册GPIO中断。
+            */
+            result = RT_EOK;
+        }
+        else
+        {
+            result = sensor_service_enable_imu_drdy();
+        }
+    }
+    else
+    {
+        if ((g_sensor_service.imu_trigger.active_mode ==SENSOR_IMU_TRIGGER_POLLING) &&
+            (g_sensor_service.imu_trigger.drdy_armed ==RT_FALSE) &&
+            (sensor_drdy_port_is_enabled() == RT_FALSE))
+        {
+            /*
+            * 已经处于安全轮询状态，重复请求不访问I2C。
+            */
+            result = RT_EOK;
+        }
+        else
+        {
+            result = sensor_service_disable_imu_drdy();
+        }
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    /*
+     * 只确认本次捕获的request_seq。
+     * 若处理期间又出现新请求，request_seq已经更大，
+     * 下一轮仍能发现request_seq != applied_seq。
+     */
+    g_sensor_service.imu_trigger.applied_seq =request_seq;
+
+    g_sensor_service.imu_trigger.last_switch_error =result;
+
+    rt_hw_interrupt_enable(level);
 }

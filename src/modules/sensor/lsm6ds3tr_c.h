@@ -44,8 +44,33 @@ typedef struct
          当前冻结配置期望值：0x44，即BDU=1、IF_INC=1、
          BLE=0且SW_RESET已经自动清零 */
 } lsm6ds3tr_c_config_readback_t;
+
+/**
+ * @brief LSM6DS3TR-C DRDY配置读回值
+ *
+ * 保存DRDY配置完成后从器件实际读回的寄存器值。
+ * 该结构只记录硬件事实，不保存派生判断。
+ */
+typedef struct
+{
+    rt_uint8_t drdy_pulse_cfg_g;
+    /**< 0x0B寄存器读回值；bit7为DRDY_PULSED。
+         当前实验期望bit7=0，即锁存DRDY。 */
+
+    rt_uint8_t int1_ctrl;
+    /**< 0x0D寄存器读回值；
+         bit1为INT1_DRDY_G，bit0为INT1_DRDY_XL。
+         DRDY启用时期望bits[1:0]=01。 */
+
+    rt_uint8_t ctrl3_c;
+    /**< 0x12寄存器读回值；
+         bit5为H_LACTIVE，bit4为PP_OD。
+         当前实物R57未贴装，因此期望保持0x44：
+         高有效、推挽、BDU和IF_INC开启。 */
+} lsm6ds3tr_c_drdy_readback_t;
+
 rt_err_t lsm6ds3tr_c_read_id(rt_uint8_t device_address,rt_uint8_t *who_am_i);     //读取LSM6DS3TR-C的WHO_AM_I寄存器值
 rt_err_t lsm6ds3tr_c_init(lsm6ds3tr_c_config_readback_t *readback);     //初始化LSM6DS3TR-C，读取关键寄存器值并保存到readback结构体
-
 rt_err_t lsm6ds3tr_c_read_sample(sensor_imu_sample_t *sample);          //读取LSM6DS3TR-C的陀螺仪和加速度计采样数据
+rt_err_t lsm6ds3tr_c_configure_drdy(rt_bool_t enable,lsm6ds3tr_c_drdy_readback_t *readback);//开启或关闭LSM6DS3TR-C的INT1 DRDY路由并验证读回值
 #endif
