@@ -2,9 +2,13 @@
 #include "rthw.h"
 #include "lvgl.h"
 #include "lvsf_font.h"
+#include <string.h>
 #include "system_diag.h"
 #include "sensor_service.h"
+#include "time_service.h"
+#include "time_calendar.h"
 
+#define UI_CLOCK_REFRESH_MS 250U
 #define UI_SENSOR_DIAG_REFRESH_MS       500U        //诊断页面初始刷新频率固定为2 Hz
 #define UI_SENSOR_DIAG_RECOVERY_MS      1000U       //从失败状态恢复到READY后显示1秒RECOVERED提示
 
@@ -62,6 +66,14 @@ typedef struct
     void *action_user_data;
 
     ui_page_stats_t stats;
+
+    //RTC时钟
+    lv_obj_t *watchface_date;               //表盘日期显示对象
+    lv_obj_t *watchface_clock_state;        //表盘时钟状态显示对象
+    lv_timer_t *watchface_timer;            //表盘刷新定时器
+
+    rt_bool_t watchface_clock_cached;       //是否缓存了表盘时钟
+    time_snapshot_t watchface_last_clock;   //上一次获取的表盘时钟快照
 
 } ui_page_context_t;
 static ui_page_context_t g_ui_page_context =
@@ -126,6 +138,11 @@ static rt_tick_t ui_page_ms_to_ticks(rt_uint32_t milliseconds); //把毫秒安�
 
 static rt_bool_t ui_page_tick_reached(rt_tick_t now_tick,rt_tick_t deadline_tick); //使用回绕安全的tick差值判断截止时间是否到达
 
+//RTC时钟相关函数
+static rt_err_t ui_page_create_clock_labels(lv_obj_t *parent,lv_obj_t **date_label,
+                                                            lv_obj_t **state_label);//创建表盘日期及时间可信状态标签
+static rt_err_t ui_page_refresh_clock(void);            //根据时间快照局部更新表盘
+static void ui_page_clock_timer_cb(lv_timer_t *timer);  //在表盘可见时触发时间刷新
 //---------------------------------------------------------------公开函数---------------------------------------------------------------
 
 /*
@@ -178,7 +195,11 @@ rt_err_t ui_page_create(void)
         (g_ui_page_context.sensor_diag_mmc_text != RT_NULL) ||
         (g_ui_page_context.sensor_diag_als_text != RT_NULL) ||
         (g_ui_page_context.sensor_diag_footer != RT_NULL) ||
-        (g_ui_page_context.sensor_diag_timer != RT_NULL))
+        (g_ui_page_context.sensor_diag_timer != RT_NULL)    ||
+        (g_ui_page_context.watchface_date != RT_NULL) ||
+        (g_ui_page_context.watchface_clock_state != RT_NULL) ||
+        (g_ui_page_context.watchface_timer != RT_NULL)
+    )
     {
         ui_page_stat_increment(
             &g_ui_page_context.stats.create_fail);
@@ -224,6 +245,16 @@ rt_err_t ui_page_create(void)
     {
         goto create_failed;
     }
+
+    g_ui_page_context.watchface_timer = lv_timer_create(ui_page_clock_timer_cb,
+                                                        UI_CLOCK_REFRESH_MS,
+                                                        RT_NULL);
+
+    if (g_ui_page_context.watchface_timer == RT_NULL)
+    {
+        result = -RT_ENOMEM;
+        goto create_failed;
+    }
     /*
      * 在装载screen之前设置初始可见性。
      * 四个页面已经完整创建，因此不会出现半切换状态。
@@ -246,7 +277,11 @@ rt_err_t ui_page_create(void)
     g_ui_page_context.stats.created = RT_TRUE;
     g_ui_page_context.stats.create_success++;
     rt_hw_interrupt_enable(level);
+    //刷新表盘
+    g_ui_page_context.watchface_clock_cached = RT_FALSE;
+    (void)ui_page_refresh_clock();
 
+    lv_timer_reset(g_ui_page_context.watchface_timer);
     //打印：[UI][PAGE] initialized current=WATCHFACE
     rt_kprintf("[UI][PAGE] initialized current=WATCHFACE\n");
     return RT_EOK;
@@ -481,7 +516,9 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     lv_obj_t *time_label;
     lv_obj_t *status_label;
     lv_obj_t *nav_button;
-
+    lv_obj_t *date_label = RT_NULL;
+    lv_obj_t *clock_state_label = RT_NULL;
+    rt_err_t result = -RT_ENOMEM;
     /* 父对象必须是已经创建成功的根screen。 */
     if (parent == RT_NULL)
     {
@@ -495,7 +532,9 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     if ((g_ui_page_context.watchface_page != RT_NULL) ||
         (g_ui_page_context.watchface_title != RT_NULL) ||
         (g_ui_page_context.watchface_time != RT_NULL) ||
-        (g_ui_page_context.watchface_status != RT_NULL))
+        (g_ui_page_context.watchface_status != RT_NULL) ||
+        (g_ui_page_context.watchface_date != RT_NULL) ||
+        (g_ui_page_context.watchface_clock_state != RT_NULL))
     {
         return -RT_EBUSY;
     }
@@ -587,7 +626,7 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
         goto create_failed;
     }
 
-    lv_label_set_text(time_label, "10:08");
+    lv_label_set_text(time_label, "--:--");
 
     lv_ext_set_local_font(
         time_label,
@@ -598,7 +637,7 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
         time_label,
         LV_ALIGN_CENTER,
         0,
-        -10);
+        -45);
  /*
      * 7. 创建状态标签。
      * 初始明确显示SIMULATED，防止用户误以为当前时间来自RTC。
@@ -610,7 +649,7 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
         goto create_failed;
     }
 
-    lv_label_set_text(status_label, "SIMULATED");
+    lv_label_set_text(status_label, "STATUS: --");
 
     lv_ext_set_local_font(
         status_label,
@@ -621,8 +660,20 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
         status_label,
         LV_ALIGN_CENTER,
         0,
-        58);
+        105);
 
+    result = ui_page_create_clock_labels(
+        page,
+        &date_label,
+        &clock_state_label);
+
+    if (result != RT_EOK)
+    {
+        goto create_failed;
+    }
+
+    /* 后续对象创建失败仍按内存不足处理。 */
+    result = -RT_ENOMEM;
     /*
     * 8. 创建表盘页NEXT按钮。
     *
@@ -648,7 +699,9 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     g_ui_page_context.watchface_title = title;
     g_ui_page_context.watchface_time = time_label;
     g_ui_page_context.watchface_status = status_label;
-
+    g_ui_page_context.watchface_date = date_label;
+    g_ui_page_context.watchface_clock_state = clock_state_label;
+    g_ui_page_context.watchface_clock_cached = RT_FALSE;
     return RT_EOK;
 
 
@@ -672,8 +725,11 @@ create_failed:
     g_ui_page_context.watchface_title = RT_NULL;
     g_ui_page_context.watchface_time = RT_NULL;
     g_ui_page_context.watchface_status = RT_NULL;
+    g_ui_page_context.watchface_date = RT_NULL;
+    g_ui_page_context.watchface_clock_state = RT_NULL;
+    g_ui_page_context.watchface_clock_cached = RT_FALSE;
 
-    return -RT_ENOMEM;
+    return result;
 }
 
 /*
@@ -1617,12 +1673,24 @@ static void ui_page_cleanup(void)
     lv_obj_t *root_screen;
     lv_timer_t *sensor_diag_timer;
     rt_uint32_t device_index;
+    lv_timer_t *watchface_timer;
+    rt_base_t level;
     /*
      * 先保存根对象。
      * 后续统一清空上下文，避免删除过程中的回调观察到悬空指针。
      */
     root_screen = g_ui_page_context.root_screen;
     sensor_diag_timer =g_ui_page_context.sensor_diag_timer;
+    watchface_timer = g_ui_page_context.watchface_timer;
+
+    //开始清空上下文前，将页面标记为不可用
+    level = rt_hw_interrupt_disable();
+
+    g_ui_page_context.stats.created = RT_FALSE;
+    g_ui_page_context.stats.current_page = UI_PAGE_COUNT;
+
+    rt_hw_interrupt_enable(level);
+
     /*
      * 将所有lv_obj_t指针设为RT_NULL
      * created=false
@@ -1634,6 +1702,13 @@ static void ui_page_cleanup(void)
     g_ui_page_context.watchface_title = RT_NULL;
     g_ui_page_context.watchface_time = RT_NULL;
     g_ui_page_context.watchface_status = RT_NULL;
+    g_ui_page_context.watchface_date = RT_NULL;
+    g_ui_page_context.watchface_clock_state = RT_NULL;
+    g_ui_page_context.watchface_timer = RT_NULL;
+
+    g_ui_page_context.watchface_clock_cached = RT_FALSE;
+
+    memset(&g_ui_page_context.watchface_last_clock,0,sizeof(g_ui_page_context.watchface_last_clock));
 
     g_ui_page_context.menu_page = RT_NULL;
     g_ui_page_context.menu_title = RT_NULL;
@@ -1669,6 +1744,11 @@ static void ui_page_cleanup(void)
     if (sensor_diag_timer != RT_NULL)
     {
         lv_timer_del(sensor_diag_timer);
+    }
+
+    if (watchface_timer != RT_NULL)
+    {
+        lv_timer_del(watchface_timer);
     }
     /*
      * root_screen是所有页面的共同父对象。
@@ -1854,6 +1934,15 @@ static rt_err_t ui_page_show(ui_page_id_t target)
     g_ui_page_context.stats.current_page=target;
     g_ui_page_context.stats.switch_success++;
     rt_hw_interrupt_enable(level);
+
+    if ((target == UI_PAGE_WATCHFACE) && (g_ui_page_context.watchface_timer != RT_NULL))
+    {
+        g_ui_page_context.watchface_clock_cached = RT_FALSE;
+
+        (void)ui_page_refresh_clock();
+
+        lv_timer_reset(g_ui_page_context.watchface_timer);
+    }
     /*
      * 进入诊断页时立即读取一次最新快照，
      * 避免用户最多等待500ms才看到数据。
@@ -3182,4 +3271,379 @@ static rt_err_t ui_page_refresh_sensor_diag(void)
     rt_hw_interrupt_enable(level);
 
     return RT_EOK;
+}
+
+/*
+ * 简介：创建表盘日期及时间可信状态标签。
+ * 输入：parent不可为空；两个输出指针不可为空且不能相同，
+ *       应指向本次创建使用的独立局部变量，不保存输出指针。
+ * 返回值：成功返回RT_EOK；参数错误返回-EINVAL；创建失败返回-ENOMEM。
+ * 说明：仅UI线程调用；成功后对象归parent所有。
+ *       失败只清理本函数创建的对象，输出保持为空。
+ */
+static rt_err_t ui_page_create_clock_labels(lv_obj_t *parent,lv_obj_t **date_label, lv_obj_t **state_label)
+{
+    lv_obj_t *date = RT_NULL;
+    lv_obj_t *state = RT_NULL;
+
+    if (date_label != RT_NULL)
+    {
+        *date_label = RT_NULL;
+    }
+
+    if (state_label != RT_NULL)
+    {
+        *state_label = RT_NULL;
+    }
+
+    if ((parent == RT_NULL) ||(date_label == RT_NULL) ||
+        (state_label == RT_NULL) ||(date_label == state_label))
+    {
+        return -RT_EINVAL;
+    }
+
+    date = lv_label_create(parent);
+    if (date == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_label_set_text(date, "----/--/--");
+    lv_ext_set_local_font(date,FONT_NORMAL,lv_color_hex(0xA8B0BA));
+
+    lv_obj_set_width(date, LV_PCT(90));
+    lv_obj_set_style_text_align( date,
+                                LV_TEXT_ALIGN_CENTER,
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_align(date, LV_ALIGN_CENTER, 0, 12);
+
+    state = lv_label_create(parent);
+    if (state == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_label_set_text(state, "UTC+08\nUNSET");
+    lv_ext_set_local_font(state,
+                            FONT_NORMAL,
+                            lv_color_hex(0xA8B0BA));
+
+    lv_obj_set_width(state, LV_PCT(90));
+    lv_label_set_long_mode(state, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(state,
+                                LV_TEXT_ALIGN_CENTER,
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_align(state, LV_ALIGN_CENTER, 0, 55);
+
+    /* 全部成功后再提交句柄。 */
+    *date_label = date;
+    *state_label = state;
+    return RT_EOK;
+
+create_failed:
+
+    if (state != RT_NULL)
+    {
+        lv_obj_del(state);
+    }
+
+    if (date != RT_NULL)
+    {
+        lv_obj_del(date);
+    }
+
+    return -RT_ENOMEM;
+}
+/*
+ * 简介：根据时间快照局部更新表盘。
+ * 输入：无。
+ * 返回值：成功或内容无需变化返回RT_EOK；
+ *         对象、快照或日历转换失败返回负错误码。
+ * 说明：仅UI线程调用；不访问RTC，不修改时间服务状态。
+ *       失败计数由本函数统一记录；lv_label_set_text复制局部文本。
+ */
+static rt_err_t ui_page_refresh_clock(void)
+{
+    time_snapshot_t snapshot = {0};
+    time_calendar_t local_calendar = {0};
+
+    const time_snapshot_t *previous;
+    const char *state_name;
+
+    char time_text[8] = "--:--";
+    char date_text[16] = "----/--/--";
+    char state_text[80] = {0};
+
+    lv_color_t color = lv_color_hex(0xA8B0BA);
+
+    rt_bool_t usable;
+    rt_bool_t warn_last_good;
+    rt_bool_t changed;
+    rt_bool_t rendered = RT_FALSE;
+
+    rt_err_t result;
+    rt_err_t refresh_result = RT_EOK;
+    int calendar_result;
+
+    if ((g_ui_page_context.stats.created != RT_TRUE) ||
+        (g_ui_page_context.watchface_page == RT_NULL) ||
+        (g_ui_page_context.watchface_time == RT_NULL) ||
+        (g_ui_page_context.watchface_date == RT_NULL) ||
+        (g_ui_page_context.watchface_clock_state == RT_NULL))
+    {
+        ui_page_stat_increment(&g_ui_page_context.stats.clock_refresh_failure_count);
+        return -RT_ERROR;
+    }
+
+    result = time_service_get_snapshot(&snapshot);
+    if (result != RT_EOK)
+    {
+        /*
+         * 无法取得副本时，不继续把旧时间展示成正常状态。
+         * 不缓存这次失败，下一次timer继续重试。
+         */
+        refresh_result = result;
+        color = lv_color_hex(0xFF7070);
+
+        rt_snprintf(state_text, sizeof(state_text),"UTC+08\nTIME COPY ERROR");
+        goto render_labels;
+    }
+
+    previous = &g_ui_page_context.watchface_last_clock;
+
+    /*
+     * 不比较sample_tick、age_ms或publish_seq：
+     * 它们可能每250ms变化，但显示内容不一定变化。
+     *
+     * fresh仍须比较，保证worker停止更新后能切换到过期显示。
+     */
+    changed =((g_ui_page_context.watchface_clock_cached != RT_TRUE) ||
+                (snapshot.utc_seconds != previous->utc_seconds) ||
+                (snapshot.calendar_generation != previous->calendar_generation) ||
+                (snapshot.service_running != previous->service_running) ||
+                (snapshot.has_value != previous->has_value) ||
+                (snapshot.trusted != previous->trusted) ||
+                (snapshot.fresh != previous->fresh) ||
+                (snapshot.state != previous->state) ||
+                (snapshot.source != previous->source) ||
+                (snapshot.error_stage != previous->error_stage) ||
+                (snapshot.last_error != previous->last_error))
+                ? RT_TRUE : RT_FALSE;
+
+    if (changed == RT_FALSE)
+    {
+        return RT_EOK;
+    }
+
+    usable =(snapshot.service_running && snapshot.has_value &&
+            snapshot.trusted && snapshot.fresh &&
+            (snapshot.state == TIME_CLOCK_READY))
+            ? RT_TRUE : RT_FALSE;
+
+    warn_last_good =(snapshot.service_running &&snapshot.has_value &&
+                    snapshot.trusted && snapshot.fresh &&
+                    (snapshot.state == TIME_CLOCK_READ_ERROR))
+                    ? RT_TRUE : RT_FALSE;
+
+    if ((usable == RT_TRUE) || (warn_last_good == RT_TRUE))
+    {
+        calendar_result = time_calendar_from_utc(snapshot.utc_seconds,
+                                                TIME_DISPLAY_OFFSET_MINUTES,
+                                                &local_calendar);
+
+        if (calendar_result != TIME_CAL_OK)
+        {
+            refresh_result =(calendar_result == TIME_CAL_NOT_IMPLEMENTED) ? -RT_ENOSYS : -RT_ERROR;
+
+            color = lv_color_hex(0xFF7070);
+
+            rt_snprintf(state_text, sizeof(state_text),
+                        "UTC+08\nCLOCK DATA ERROR");
+            goto render_labels;
+        }
+
+        rt_snprintf(time_text, sizeof(time_text),
+                    "%02u:%02u",
+                    (unsigned int)local_calendar.hour,
+                    (unsigned int)local_calendar.minute);
+
+        rt_snprintf(date_text, sizeof(date_text),
+                    "%04u-%02u-%02u",
+                    (unsigned int)local_calendar.year,
+                    (unsigned int)local_calendar.month,
+                    (unsigned int)local_calendar.day);
+
+        state_name = (warn_last_good == RT_TRUE)
+                     ? "WARN READ" : "SYNCED";
+
+        color = (warn_last_good == RT_TRUE)
+                ? lv_color_hex(0xFFCC66)
+                : lv_color_hex(0x50D890);
+
+        rt_snprintf(state_text, sizeof(state_text),
+                    "SS:%02u  UTC+08\n%s",
+                    (unsigned int)local_calendar.second,
+                    state_name);
+    }
+    else
+    {
+        /*
+         * 保留明确故障原因的优先级。
+         * 例如UNCERTAIN不会因为旧值超龄而只显示普通STALE。
+         */
+        if (!snapshot.service_running)
+        {
+            if (snapshot.last_error != RT_EOK)
+            {
+                state_name = "TIME SERVICE ERROR";
+                color = lv_color_hex(0xFF7070);
+            }
+            else
+            {
+                state_name = "STARTING";
+            }
+        }
+        else if (snapshot.state == TIME_CLOCK_SYNCING)
+        {
+            state_name = "SYNCING";
+            color = lv_color_hex(0x80BFFF);
+        }
+        else if (snapshot.state == TIME_CLOCK_UNCERTAIN)
+        {
+            state_name = "SYNC FAILED";
+            color = lv_color_hex(0xFF7070);
+        }
+        else if (snapshot.state == TIME_CLOCK_INVALID)
+        {
+            state_name = "RTC INVALID";
+            color = lv_color_hex(0xFF7070);
+        }
+        else if (snapshot.state == TIME_CLOCK_NO_DEVICE)
+        {
+            state_name = "RTC UNAVAILABLE";
+            color = lv_color_hex(0xFF7070);
+        }
+        else if (!snapshot.has_value)
+        {
+            if (snapshot.state == TIME_CLOCK_READ_ERROR)
+            {
+                state_name = "RTC READ ERROR";
+                color = lv_color_hex(0xFF7070);
+            }
+            else
+            {
+                state_name = "WAIT RTC";
+            }
+        }
+        else if (!snapshot.fresh ||
+                 (snapshot.state == TIME_CLOCK_STALE))
+        {
+            state_name = "TIME STALE";
+            color = lv_color_hex(0xFF7070);
+        }
+        else if (!snapshot.trusted ||
+                 (snapshot.state == TIME_CLOCK_UNSET))
+        {
+            state_name = "UNSET";
+            color = lv_color_hex(0xFFCC66);
+        }
+        else
+        {
+            /* 未知组合也不展示为正常可信时间。 */
+            state_name = "TIME WAIT";
+        }
+
+        rt_snprintf(state_text, sizeof(state_text),
+                    "UTC+08\n%s", state_name);
+    }
+
+render_labels:
+
+    /*
+     * 即使秒变化，也只修改实际变化的标签：
+     * 大号HH:MM通常每分钟变化，日期通常每天变化。
+     */
+    if (strcmp(lv_label_get_text(g_ui_page_context.watchface_time),time_text) != 0)
+    {
+        lv_label_set_text( g_ui_page_context.watchface_time, time_text);
+        rendered = RT_TRUE;
+    }
+
+    if (strcmp(lv_label_get_text(g_ui_page_context.watchface_date),
+               date_text) != 0)
+    {
+        lv_label_set_text(g_ui_page_context.watchface_date, date_text);
+        rendered = RT_TRUE;
+    }
+
+    if (strcmp(lv_label_get_text(g_ui_page_context.watchface_clock_state),state_text) != 0)
+    {
+        lv_label_set_text(g_ui_page_context.watchface_clock_state, state_text);
+        rendered = RT_TRUE;
+    }
+
+    if (!lv_color_eq(lv_obj_get_style_text_color(g_ui_page_context.watchface_time, LV_PART_MAIN), color))
+    {
+        lv_obj_set_style_text_color(g_ui_page_context.watchface_time,
+                                    color,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+
+        rendered = RT_TRUE;
+    }
+
+    if (!lv_color_eq(lv_obj_get_style_text_color(g_ui_page_context.watchface_clock_state, LV_PART_MAIN),color))
+    {
+        lv_obj_set_style_text_color(
+            g_ui_page_context.watchface_clock_state,
+            color,
+            LV_PART_MAIN | LV_STATE_DEFAULT);
+
+        rendered = RT_TRUE;
+    }
+
+    if (rendered == RT_TRUE)
+    {
+        ui_page_stat_increment(
+            &g_ui_page_context.stats.clock_render_count);
+    }
+
+    if (refresh_result == RT_EOK)
+    {
+        g_ui_page_context.watchface_last_clock = snapshot;
+        g_ui_page_context.watchface_clock_cached = RT_TRUE;
+    }
+    else
+    {
+        g_ui_page_context.watchface_clock_cached = RT_FALSE;
+
+        ui_page_stat_increment(
+            &g_ui_page_context.stats.clock_refresh_failure_count);
+    }
+
+    return refresh_result;
+}
+
+/*
+ * 简介：在表盘可见时触发时间刷新。
+ * 输入：timer由LVGL提供，本函数不保存其指针。
+ * 返回值：无。
+ * 说明：运行于UI线程；隐藏时跳过快照读取和标签更新。
+ *       失败计数由refresh_clock统一记录，不重复累计。
+ */
+static void ui_page_clock_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    ui_page_stat_increment(&g_ui_page_context.stats.clock_timer_fire_count);
+
+    if ((g_ui_page_context.stats.created != RT_TRUE) ||
+        (g_ui_page_context.stats.current_page != UI_PAGE_WATCHFACE))
+    {
+        ui_page_stat_increment(&g_ui_page_context.stats.clock_hidden_skip_count);
+        return;
+    }
+
+    (void)ui_page_refresh_clock();
 }

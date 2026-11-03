@@ -1982,6 +1982,11 @@ static int ui_stats(void)
         (unsigned int)
             sensor_diag_stats.max_render_ticks);
 
+    rt_kprintf("[UI][CLOCK] timer=%u hidden=%u render=%u fail=%u\n",
+           (unsigned int)ui_page_stats.clock_timer_fire_count,
+           (unsigned int)ui_page_stats.clock_hidden_skip_count,
+           (unsigned int)ui_page_stats.clock_render_count,
+           (unsigned int)ui_page_stats.clock_refresh_failure_count);
     return 0;
 }
 static int ui_touch_diag(int argc, char **argv)

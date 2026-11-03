@@ -5,6 +5,7 @@
 #include "ui_runtime.h"
 #include "ui_event.h"
 #include "sensor_service.h"
+#include "time_service.h"
 
 #define APP_EVENT_QUEUE_DEPTH  8U
 #define APP_THREAD_STACK_SIZE  2048U
@@ -181,6 +182,14 @@ rt_err_t app_main_init(void)
                 (unsigned int)g_indicator_available);
     }
 
+    // 初始化时间服务
+    result = time_service_init();
+
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[APP][TIME][WARN] service start failed: %d\n",
+                (int)result);
+    }
     //ui模块初始化
     app_event_t ui_event;
     rt_err_t post_result;

@@ -32,6 +32,11 @@ typedef struct
     rt_uint32_t touch_action_attempt;   //触摸动作尝试次数
     rt_uint32_t touch_action_success;   //触摸动作成功次数
     rt_uint32_t touch_action_fail;      //触摸动作失败次数
+
+    rt_uint32_t clock_timer_fire_count;       // 表盘timer回调次数
+    rt_uint32_t clock_hidden_skip_count;      // 未创建或隐藏时跳过次数
+    rt_uint32_t clock_render_count;           // 实际修改标签文本或颜色的次数
+    rt_uint32_t clock_refresh_failure_count;  // 对象、快照或转换失败次数
 } ui_page_stats_t;
 
 /*
