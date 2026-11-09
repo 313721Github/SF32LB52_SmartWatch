@@ -156,6 +156,9 @@ typedef struct
     sensor_notify_handler_t notify_handler;
     void *notify_user_data;
 
+    sensor_imu_sink_t imu_sink;     //IMU样本下游回调，sensor线程在snapshot mutex之外调用
+    void *imu_sink_user_data;       //IMU样本下游回调的用户数据
+
     //重探请求使用位图合并，调用者只提交请求，真实I2C操作由sensor线程执行
     rt_uint32_t pending_probe_mask;
 
@@ -196,7 +199,9 @@ static sensor_service_context_t g_sensor_service =
     .wake_event = RT_NULL,
     .thread = RT_NULL,
     .notify_handler = RT_NULL,
-    .notify_user_data = RT_NULL
+    .notify_user_data = RT_NULL,
+    .imu_sink = RT_NULL,
+    .imu_sink_user_data = RT_NULL,
 };
 
 //公开函数声明
@@ -221,7 +226,7 @@ rt_err_t sensor_service_request_probe(rt_uint32_t device_mask);     //请求sens
 rt_err_t sensor_service_test_inject(sensor_device_id_t device,sensor_test_fault_t fault,rt_uint32_t count);//为指定器件配置固定次数的软件故障注入
 rt_err_t sensor_service_request_imu_trigger_mode(sensor_imu_trigger_mode_t mode);                          //异步请求切换IMU轮询或DRDY模式
 rt_err_t sensor_service_get_imu_trigger_status(sensor_imu_trigger_status_t *status);                       //复制IMU触发模式、DRDY状态和累计统计
-
+rt_err_t sensor_service_register_imu_sink(sensor_imu_sink_t handler, void *user_data);                     //注册或注销唯一的逐IMU样本接收者
 //私有函数声明
 static void sensor_service_thread_entry(void *parameter);
 
@@ -273,7 +278,7 @@ static void sensor_service_process_imu(rt_tick_t now);          //执行一次IM
 static void sensor_service_process_mmc(rt_tick_t now);          //推进MMC5603NJ单次测量状态机并提交有效磁场样本
 static void sensor_service_process_als(rt_tick_t now);          //推进LTR303连续测量的NEW等待窗口并提交有效ALS样本
 
-static void sensor_service_notify_if_due(void);
+static void sensor_service_notify_if_due(void);                 //按合并位图和最小通知间隔向上层发送sensor状态或快照变化通知
 
 static void sensor_service_record_loop(rt_tick_t loop_ticks);   //记录sensor线程最近一轮调度处理时间和历史最大处理时间
 
@@ -953,6 +958,43 @@ rt_err_t sensor_service_get_imu_trigger_status(sensor_imu_trigger_status_t *stat
 
     return RT_EOK;
 }
+/*
+ * 简介：在sensor启动前设置逐IMU样本接收者。
+ * 输入：handler和user_data含义见公开接口；本函数不保留样本指针。
+ * 返回值：成功RT_EOK；不允许注册时-RT_EBUSY。
+ * 说明：短临界区内只检查生命周期和复制回调字段。
+ *       不执行资源分配、日志、设备操作或实际回调。
+ */
+rt_err_t sensor_service_register_imu_sink(sensor_imu_sink_t handler,void *user_data)
+{
+    rt_base_t level;
+    rt_err_t result = RT_EOK;
+
+    level = rt_hw_interrupt_disable();
+
+    if (g_sensor_service.state != SENSOR_SERVICE_STATE_STOPPED)
+    {
+        result = -RT_EBUSY;
+    }
+    else if ((handler != RT_NULL) &&
+             (g_sensor_service.imu_sink != RT_NULL) &&
+             ((g_sensor_service.imu_sink != handler) ||
+              (g_sensor_service.imu_sink_user_data != user_data)))
+    {
+        /* 非空注册只能填入空槽，或重复提交完全相同的一对值。 */
+        result = -RT_EBUSY;
+    }
+    else
+    {
+        /* 注销时同时清除上下文，避免留下旧指针。 */
+        g_sensor_service.imu_sink = handler;
+        g_sensor_service.imu_sink_user_data =(handler != RT_NULL) ? user_data : RT_NULL;
+    }
+
+    /* 所有路径都在这里恢复进入函数前的中断状态。 */
+    rt_hw_interrupt_enable(level);
+    return result;
+}
 //---------------------------------------------------------------私有函数---------------------------------------------------------------
 /*
  * 简介：统一sensor线程入口，负责三器件初始化、调度、重探和通知。
@@ -1565,6 +1607,9 @@ static rt_err_t sensor_service_commit_sample(sensor_device_id_t device,const voi
     rt_uint32_t config_version;
     rt_bool_t recovered;
     rt_err_t result;
+    sensor_imu_sink_t imu_sink = RT_NULL;
+    void *imu_sink_user_data = RT_NULL;
+    rt_uint32_t committed_imu_seq = 0U;
 
     /* 同时验证器件编号和样本缓冲区。 */
     if ((device >= SENSOR_DEVICE_COUNT) ||
@@ -1662,6 +1707,13 @@ static rt_err_t sensor_service_commit_sample(sensor_device_id_t device,const voi
     status->valid = RT_TRUE;
     status->stale = RT_FALSE;
     status->seq++;
+    /* 锁内保存本次IMU的提交序号和接收者，解锁后再调用。 */
+    if (device == SENSOR_DEVICE_IMU)
+    {
+        committed_imu_seq = status->seq;
+        imu_sink = g_sensor_service.imu_sink;
+        imu_sink_user_data = g_sensor_service.imu_sink_user_data;
+    }
     status->config_version = config_version;
     status->sample_tick = sample_tick;
     status->last_success_tick = sample_tick;
@@ -1697,7 +1749,20 @@ static rt_err_t sensor_service_commit_sample(sensor_device_id_t device,const voi
     g_sensor_service.notify_pending_mask |=sensor_service_device_mask(device);
 
     result = rt_mutex_release(g_sensor_service.snapshot_mutex);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
 
+    /*
+    * imu_sink只在IMU提交路径上取得。
+    * 原sample与committed_imu_seq属于同一次提交。
+    * 接收者须在回调返回前完成复制，投递结果由运动通道统计。
+    */
+    if (imu_sink != RT_NULL)
+    {
+        (void)imu_sink((const sensor_imu_sample_t *)sample,committed_imu_seq,imu_sink_user_data);
+    }
     return result;
 }
 /*

@@ -14,6 +14,7 @@ inc = [
     os.path.join(cwd, 'gui'),
     os.path.join(cwd, 'apps'),
     os.path.join(cwd, 'modules', 'time'),
+    os.path.join(cwd, 'modules', 'motion'),
 ]
 
 # 核心魔法：在这里登记你需要编译的子文件夹！
@@ -27,6 +28,7 @@ src.extend(SConscript(os.path.join(cwd, 'modules/mem/SConscript'), variant_dir="
 src.extend(SConscript(os.path.join(cwd, 'hal_port/SConscript'), variant_dir="hal_port", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'apps/SConscript'), variant_dir="apps", duplicate=0))
 src.extend(SConscript(os.path.join(cwd, 'modules/time/SConscript'), variant_dir="modules_time", duplicate=0))
+src.extend(SConscript(os.path.join(cwd, 'modules/motion/SConscript'), variant_dir="modules_motion", duplicate=0))
 
 # 2. 修复 lang_pack.h：加载多语言和字体资源
 Execute(Mkdir('gui/resource/strings')) # 确保目录存在

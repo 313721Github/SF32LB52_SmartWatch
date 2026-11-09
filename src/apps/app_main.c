@@ -6,6 +6,7 @@
 #include "ui_event.h"
 #include "sensor_service.h"
 #include "time_service.h"
+#include "motion_service.h"
 
 #define APP_EVENT_QUEUE_DEPTH  8U
 #define APP_THREAD_STACK_SIZE  2048U
@@ -61,6 +62,8 @@ static int app_event_flood(void);
 rt_err_t app_main_init(void)
 {
     rt_err_t result;
+    uint32_t motion_start_request_id = 0U;
+    rt_err_t motion_result;
 
     if (g_app_initialized == RT_TRUE)
     {
@@ -233,6 +236,38 @@ rt_err_t app_main_init(void)
             result);
         }
     }
+
+    /*
+    * motion先建立接收资源和回调，再启动sensor生产。
+    * 时间服务已经在前面初始化；未校时不阻断运动业务。
+    */
+    motion_result = motion_service_init();
+
+    if (motion_result == RT_EOK)
+    {
+        motion_result = motion_service_request_start(&motion_start_request_id);
+
+        if (motion_result != RT_EOK)
+        {
+            rt_kprintf("[APP][MOTION][WARN] start request rejected: %d\n",
+                    (int)motion_result);
+        }
+        else
+        {
+            /*
+            * 这里只报告受理，不能打印“计步启动完成”。
+            * worker稍后执行并按ID保存结果。
+            */
+            rt_kprintf("[APP][MOTION] start accepted id=%lu\n",
+                    (unsigned long)motion_start_request_id);
+        }
+    }
+    else
+    {
+        rt_kprintf("[APP][MOTION][WARN] init failed: %d\n",
+                (int)motion_result);
+    }
+
     /*
      * 启动统一sensor服务。
      *

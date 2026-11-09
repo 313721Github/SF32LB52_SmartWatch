@@ -35,6 +35,10 @@ rt_err_t sensor_service_test_inject(sensor_device_id_t device,sensor_test_fault_
 rt_err_t sensor_service_request_imu_trigger_mode(sensor_imu_trigger_mode_t mode);           //提交模式切换请求，由sensor线程执行
 
 rt_err_t sensor_service_get_imu_trigger_status(sensor_imu_trigger_status_t *status);        //复制当前触发模式及DRDY统计
+typedef rt_err_t (*sensor_imu_sink_t)(const sensor_imu_sample_t *sample,
+                                    rt_uint32_t imu_seq,void *user_data);                   //完整IMU成功提交后的同步回调
+
+rt_err_t sensor_service_register_imu_sink(sensor_imu_sink_t handler, void *user_data);      //注册或注销唯一的逐IMU样本接收者
 #ifdef __cplusplus
 }
 #endif

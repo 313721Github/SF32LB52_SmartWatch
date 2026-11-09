@@ -1,0 +1,18 @@
+from building import *
+
+cwd = GetCurrentDir()
+
+# 自动收集本目录后续新增的业务核心、服务和Shell诊断C文件。
+# 头文件存在本身不会产生可执行功能。
+src = Glob('*.c')
+
+# 纯业务类型和业务核心不绑定某个I2C控制器。
+# RT-Thread服务与sensor的实际连接由后续C实现负责。
+group = DefineGroup(
+    'motion_module',
+    src,
+    depend=[''],
+    CPPPATH=[cwd]
+)
+
+Return('group')
