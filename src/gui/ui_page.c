@@ -7,11 +7,16 @@
 #include "sensor_service.h"
 #include "time_service.h"
 #include "time_calendar.h"
+#include "motion_service.h"
+#include "ui_touch_diag.h"
 
 #define UI_CLOCK_REFRESH_MS 250U
 #define UI_SENSOR_DIAG_REFRESH_MS       500U        //诊断页面初始刷新频率固定为2 Hz
 #define UI_SENSOR_DIAG_RECOVERY_MS      1000U       //从失败状态恢复到READY后显示1秒RECOVERED提示
-
+#define UI_MENU_TAP_SLOP_PX 12                      //初始点按容差，实机复核后再调整
+#define UI_MOTION_REFRESH_MS 500U                   //运动页面刷新频率固定为2 Hz
+#define UI_NOTICE_TIMER_PERIOD_MS 100U              // 到期检查周期，区别于10秒显示时长
+#define UI_NOTICE_TAP_SLOP_PX 12                    // 关闭按钮的初始点按容差
 
 /*
  * UI最终显示状态。
@@ -34,10 +39,49 @@ typedef struct
     lv_obj_t *watchface_title;
     lv_obj_t *watchface_time;
     lv_obj_t *watchface_status;
+    lv_obj_t *watchface_motion_label;   // 表盘的本次启动步数摘要
 
     lv_obj_t *menu_page;
     lv_obj_t *menu_title;
-    lv_obj_t *menu_items;
+    lv_obj_t *menu_list;                  // 菜单页拥有的LVGL列表
+    /* 菜单本次按压留下的状态 */
+    lv_obj_t *menu_pressed_row;           // 当前触摸序列最初按下的菜单行
+    lv_point_t menu_press_start;          // 按下时的屏幕坐标
+    rt_bool_t menu_press_dragged;         // 本次触摸已经滚动或越过点按容差
+
+    lv_obj_t *motion_page;                // 根屏拥有的运动页容器
+    lv_obj_t *motion_body_label;        // 运动详情的计数与状态
+    lv_timer_t *motion_refresh_timer;  // 表盘和运动页共用的刷新定时器
+
+    lv_obj_t *recent_notifications_page;  // 根屏拥有的最近通知页容器
+    char recent_title_text[UI_NOTICE_TITLE_MAX_BYTES + 1U]; //最近通知标题文本缓冲区
+    char recent_body_text[UI_NOTICE_BODY_MAX_BYTES + 1U]; //最近通知正文文本缓冲区
+
+    char overlay_title_text[UI_NOTICE_TITLE_MAX_BYTES + 1U]; //弹窗通知标题文本缓冲区
+    char overlay_body_text[UI_NOTICE_BODY_MAX_BYTES + 1U];   //弹窗通知正文文本缓冲区
+    ui_notice_message_t latest_notice; // 最近一条原始通知，由UI线程独占
+    rt_bool_t has_latest_notice;       // 是否已有可回看的通知
+    rt_bool_t recent_notice_dirty;     // 最近记录变化，等待页面刷新
+    lv_obj_t *recent_notice_content;   // 可纵向滚动的内容容器
+    lv_obj_t *recent_notice_title;     // 通知标题标签，区别于页面顶部标题
+    lv_obj_t *recent_notice_body;      // 通知正文标签
+
+    lv_obj_t *notice_overlay;       // 全屏遮罩，拦截底页触摸
+    lv_obj_t *notice_overlay_title; // 弹层标题标签
+    lv_obj_t *notice_overlay_body;  // 弹层正文标签
+    lv_obj_t *notice_close_button;  // 关闭按钮
+    lv_timer_t *notice_timer;       // 检查当前通知是否到期
+    lv_point_t notice_close_press_start; // 按下关闭按钮时的坐标
+    rt_bool_t notice_close_dragged;      // 本次按压是否已经拖动
+
+    rt_bool_t notice_visible;           // 弹层当前是否可见
+    ui_page_id_t notice_return_page;    // 首次显示弹层时的底页
+    uint32_t notice_display_id;         // 当前可见通知的请求ID
+    uint32_t notice_pressed_close_id;   // 按下关闭按钮时捕获的显示ID
+    rt_tick_t notice_deadline;          // 当前通知的单调截止tick
+
+
+    lv_obj_t *settings_page;              // 根屏拥有的设置页容器
 
     lv_obj_t *system_info_page;
     lv_obj_t *system_info_title;
@@ -85,9 +129,24 @@ static ui_page_context_t g_ui_page_context =
     }
 };
 
-static const ui_action_t g_ui_nav_home = UI_ACTION_HOME;
 static const ui_action_t g_ui_nav_back = UI_ACTION_BACK;
-static const ui_action_t g_ui_nav_next = UI_ACTION_NEXT;
+static const ui_page_id_t g_ui_swipe_watchface = UI_PAGE_WATCHFACE;
+static const ui_page_id_t g_ui_swipe_motion = UI_PAGE_MOTION;
+static const ui_page_id_t g_ui_swipe_recent_notifications = UI_PAGE_RECENT_NOTIFICATIONS;
+
+//菜单项定义
+typedef struct
+{
+    const char *label;
+    ui_page_id_t target;
+} ui_menu_item_t;
+
+static const ui_menu_item_t g_ui_menu_items[] =
+{
+    { "传感器", UI_PAGE_SENSOR_DIAG },
+    { "设置", UI_PAGE_SETTINGS },
+    { "系统信息", UI_PAGE_SYSTEM_INFO }
+};
 
 //公开函数声明
 rt_err_t ui_page_create(void);                              //创建ui界面
@@ -95,6 +154,9 @@ rt_err_t ui_page_handle_event(const ui_event_t *event);     //ui事件处理函�
 rt_err_t ui_page_get_stats(ui_page_stats_t *stats);         //获取ui页面统计信息
 rt_err_t ui_page_register_action_handler(ui_page_action_handler_t handler,void *user_data); //注册页面动作处理函数
 rt_err_t ui_page_get_sensor_diag_stats(ui_sensor_diag_stats_t *stats);  //获取传感器诊断页面刷新统计
+rt_err_t ui_page_notification_present(const ui_notice_message_t *message, ui_notice_outcome_t *outcome);    //显示、替换或合并一条有效通知
+rt_err_t ui_page_notification_close(uint32_t expected_id, ui_notice_close_reason_t reason); //关闭指定显示身份的通知弹层
+rt_err_t ui_page_on_touch_diag_enabled(void);               //触摸诊断启用后，结束产品弹层及残留触摸
 //私有函数声明
 static rt_err_t ui_page_create_watchface(lv_obj_t *parent);         //创建表盘页面
 static rt_err_t ui_page_create_menu(lv_obj_t *parent);              //创建菜单页面
@@ -109,8 +171,11 @@ static rt_err_t ui_page_apply_visibility(ui_page_id_t target);      //ui界面�
 static rt_err_t ui_page_show(ui_page_id_t target);                  //切换到指定页面
 
 static rt_bool_t ui_page_id_is_valid(ui_page_id_t page);            //检查页面id是否有效
-static ui_page_id_t ui_page_next_id(ui_page_id_t current);          //获取下一个页面ID
+static ui_page_id_t ui_page_swipe_target(ui_page_id_t current,ui_action_t action);     //根据来源页和横滑方向计算目标
 static ui_page_id_t ui_page_back_id(ui_page_id_t current);          //获取返回页面ID
+static void ui_page_post_touch_action(ui_action_t action, rt_uint32_t value);//向UI队列提交一个触摸动作，并记录投递结果
+static void ui_page_menu_row_event_cb(lv_event_t *event);           //处理菜单行按压、拖动取消和短点击
+static void ui_page_swipe_event_cb(lv_event_t *event);              //将水平手势转换为带来源页的UI动作
 static void ui_page_nav_event_cb(lv_event_t *event);                //LVGL点击回调
 static void ui_page_cleanup(void);                                  //ui界面统一清理函数
 static void ui_page_stat_increment(rt_uint32_t *counter);           //线程安全地增加一个32位统计计数
@@ -143,6 +208,27 @@ static rt_err_t ui_page_create_clock_labels(lv_obj_t *parent,lv_obj_t **date_lab
                                                             lv_obj_t **state_label);//创建表盘日期及时间可信状态标签
 static rt_err_t ui_page_refresh_clock(void);            //根据时间快照局部更新表盘
 static void ui_page_clock_timer_cb(lv_timer_t *timer);  //在表盘可见时触发时间刷新
+
+//创建最小页面容器
+static rt_err_t ui_page_create_placeholder(lv_obj_t *parent,const char *title,const char *body,
+                                           rt_bool_t with_back,lv_obj_t **out_page);    //创建最小页面容器及其占位文字
+static rt_err_t ui_page_create_motion(lv_obj_t *parent);    //创建运动页面和可更新的详情标签
+static rt_err_t ui_page_refresh_motion(void);               //刷新当前可见页面的运动信息
+static void ui_page_motion_timer_cb(lv_timer_t *timer);
+
+//通知页面
+static void ui_page_cancel_product_touch(void);     //取消产品页面尚未结束的触摸序列
+
+static rt_err_t ui_page_prepare_notice_text(const char *text, size_t length,  const lv_font_t *font,
+                                           char *output,size_t capacity);   //将通知文本转换为指定字体可显示的有限UTF-8文本
+static rt_err_t ui_page_create_recent_notifications(lv_obj_t *parent);      //创建最近通知页及其可滚动回看区域
+static rt_err_t ui_page_refresh_recent_notification(void);                  //根据最近通知记录刷新回看页面
+static rt_err_t ui_page_create_notification_overlay(lv_obj_t *parent);
+static void ui_page_notification_timer_cb(lv_timer_t *timer);
+static void ui_page_notification_close_cb(lv_event_t *event);
+static rt_err_t ui_page_u64_to_decimal(uint64_t value,
+                                      char *buffer,
+                                      size_t capacity);             //把64位无符号计数转换为十进制字符串
 //---------------------------------------------------------------公开函数---------------------------------------------------------------
 
 /*
@@ -183,9 +269,10 @@ rt_err_t ui_page_create(void)
         (g_ui_page_context.watchface_title != RT_NULL) ||
         (g_ui_page_context.watchface_time != RT_NULL) ||
         (g_ui_page_context.watchface_status != RT_NULL) ||
+        (g_ui_page_context.watchface_motion_label != RT_NULL) ||
         (g_ui_page_context.menu_page != RT_NULL) ||
         (g_ui_page_context.menu_title != RT_NULL) ||
-        (g_ui_page_context.menu_items != RT_NULL) ||
+        (g_ui_page_context.menu_list != RT_NULL) ||
         (g_ui_page_context.system_info_page != RT_NULL) ||
         (g_ui_page_context.system_info_title != RT_NULL) ||
         (g_ui_page_context.system_info_text != RT_NULL) ||
@@ -198,8 +285,16 @@ rt_err_t ui_page_create(void)
         (g_ui_page_context.sensor_diag_timer != RT_NULL)    ||
         (g_ui_page_context.watchface_date != RT_NULL) ||
         (g_ui_page_context.watchface_clock_state != RT_NULL) ||
-        (g_ui_page_context.watchface_timer != RT_NULL)
-    )
+        (g_ui_page_context.watchface_timer != RT_NULL)  ||
+        (g_ui_page_context.menu_pressed_row != RT_NULL) ||
+        (g_ui_page_context.motion_page != RT_NULL) ||
+        (g_ui_page_context.motion_body_label != RT_NULL) ||
+        (g_ui_page_context.motion_refresh_timer != RT_NULL) ||
+        (g_ui_page_context.recent_notifications_page != RT_NULL) ||
+        (g_ui_page_context.recent_notice_content != RT_NULL) ||
+        (g_ui_page_context.recent_notice_title != RT_NULL) ||
+        (g_ui_page_context.recent_notice_body != RT_NULL) ||
+        (g_ui_page_context.settings_page != RT_NULL))
     {
         ui_page_stat_increment(
             &g_ui_page_context.stats.create_fail);
@@ -223,6 +318,18 @@ rt_err_t ui_page_create(void)
     {
         goto create_failed;
     }
+    //为表盘页增加手势回调
+    lv_obj_add_flag(g_ui_page_context.watchface_page, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_ui_page_context.watchface_page, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    if (lv_obj_add_event_cb(g_ui_page_context.watchface_page,
+                            ui_page_swipe_event_cb,
+                            LV_EVENT_GESTURE,
+                            (void *)&g_ui_swipe_watchface) == NULL)
+    {
+        result = -RT_ENOMEM;
+        goto create_failed;
+    }
 
     result=ui_page_create_menu(g_ui_page_context.root_screen);
     if(result!=RT_EOK)
@@ -236,6 +343,57 @@ rt_err_t ui_page_create(void)
         goto create_failed;
     }
 
+    result = ui_page_create_motion(g_ui_page_context.root_screen);
+    if (result != RT_EOK)
+    {
+        goto create_failed;
+    }
+
+    //为运动页增加手势回调
+    lv_obj_add_flag(g_ui_page_context.motion_page, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_ui_page_context.motion_page, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    if (lv_obj_add_event_cb(g_ui_page_context.motion_page,
+                            ui_page_swipe_event_cb,
+                            LV_EVENT_GESTURE,
+                            (void *)&g_ui_swipe_motion) == NULL)
+    {
+        result = -RT_ENOMEM;
+        goto create_failed;
+    }
+
+    //创建最近通知页
+    result = ui_page_create_recent_notifications(g_ui_page_context.root_screen);
+    if (result != RT_EOK)
+    {
+        goto create_failed;
+    }
+    //为最近通知页增加手势回调
+    lv_obj_add_flag(g_ui_page_context.recent_notifications_page, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_ui_page_context.recent_notifications_page, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    if (lv_obj_add_event_cb(g_ui_page_context.recent_notifications_page,
+                            ui_page_swipe_event_cb,
+                            LV_EVENT_GESTURE,
+                            (void *)&g_ui_swipe_recent_notifications) == NULL)
+    {
+        result = -RT_ENOMEM;
+        goto create_failed;
+    }
+
+    result = ui_page_create_placeholder(g_ui_page_context.root_screen,
+                                        "设置",
+                                        "亮度模式: --\n"
+                                        "息屏时间: --\n"
+                                        "运动设置: 预览\n"
+                                        "未保存 / 未应用",
+                                        RT_TRUE,
+                                        &g_ui_page_context.settings_page);
+
+    if (result != RT_EOK)
+    {
+        goto create_failed;
+    }
     /*
      * 诊断页面进入与其他页面相同的一次创建、隐藏复用生命周期。
      * 这里暂时只创建静态占位符，不访问sensor服务。
@@ -253,6 +411,24 @@ rt_err_t ui_page_create(void)
     if (g_ui_page_context.watchface_timer == RT_NULL)
     {
         result = -RT_ENOMEM;
+        goto create_failed;
+    }
+
+    //创建运动刷新定时器
+    g_ui_page_context.motion_refresh_timer = lv_timer_create(ui_page_motion_timer_cb,
+                                                            UI_MOTION_REFRESH_MS,
+                                                            RT_NULL);
+
+    if (g_ui_page_context.motion_refresh_timer == RT_NULL)
+    {
+        result = -RT_ENOMEM;
+        goto create_failed;
+    }
+
+    //创建通知浮层
+    result = ui_page_create_notification_overlay(g_ui_page_context.root_screen);
+    if (result != RT_EOK)
+    {
         goto create_failed;
     }
     /*
@@ -283,6 +459,12 @@ rt_err_t ui_page_create(void)
 
     lv_timer_reset(g_ui_page_context.watchface_timer);
     //打印：[UI][PAGE] initialized current=WATCHFACE
+    /* 首屏立即显示一次，之后由低频定时器刷新。 */
+
+    (void)ui_page_refresh_motion();
+
+    lv_timer_reset(g_ui_page_context.motion_refresh_timer);
+
     rt_kprintf("[UI][PAGE] initialized current=WATCHFACE\n");
     return RT_EOK;
 create_failed:
@@ -318,6 +500,8 @@ create_failed:
 rt_err_t ui_page_handle_event(const ui_event_t *event)
 {
     ui_page_id_t target_page;
+    ui_page_id_t current_page;
+
     if(event==RT_NULL)
     {
         return -RT_EINVAL;
@@ -330,22 +514,71 @@ rt_err_t ui_page_handle_event(const ui_event_t *event)
         return -RT_EBUSY;
     }
 
+    current_page = g_ui_page_context.stats.current_page;
+
+    if (g_ui_page_context.notice_visible == RT_TRUE)
+    {
+        switch (event->type)
+        {
+        case UI_ACTION_BACK:
+        case UI_ACTION_HOME:
+            /* 关闭覆盖层后保持原页，后续独立动作再进行导航。 */
+            return ui_page_notification_close( g_ui_page_context.notice_display_id,  UI_NOTICE_CLOSE_MANUAL);
+
+        case UI_ACTION_OPEN_MENU:
+        case UI_ACTION_SWIPE_LEFT:
+        case UI_ACTION_SWIPE_RIGHT:
+        case UI_ACTION_OPEN_DETAIL:
+            return RT_EOK;
+        default:
+            break;
+        }
+    }
     //处理ui事件
     switch (event->type)
     {
     case UI_ACTION_HOME:
         /* 任意页面返回表盘；已在表盘时属于合法noop。 */
         return ui_page_show(UI_PAGE_WATCHFACE);
-    case UI_ACTION_NEXT:
-        target_page = ui_page_next_id(
-            g_ui_page_context.stats.current_page);
+    case UI_ACTION_OPEN_MENU:
+        return ui_page_show(UI_PAGE_MENU);
 
-        if (ui_page_id_is_valid(target_page) != RT_TRUE)
+    case UI_ACTION_OPEN_DETAIL:
+        if (event->value != (rt_uint32_t)UI_PAGE_SENSOR_DIAG &&
+            event->value != (rt_uint32_t)UI_PAGE_SETTINGS &&
+            event->value != (rt_uint32_t)UI_PAGE_SYSTEM_INFO)
         {
             return -RT_EINVAL;
         }
 
+        /* 菜单已经退出时，忽略尚在队列中的点选。 */
+        if (current_page != UI_PAGE_MENU)
+        {
+            return RT_EOK;
+        }
+
+        return ui_page_show((ui_page_id_t)event->value);
+
+    case UI_ACTION_SWIPE_LEFT:
+    case UI_ACTION_SWIPE_RIGHT:
+        /* 来源页已经变化，本次手势失效。 */
+        if (event->value != (rt_uint32_t)current_page)
+        {
+            return RT_EOK;
+        }
+
+        target_page = ui_page_swipe_target(current_page, event->type);
+        if (target_page == UI_PAGE_COUNT)
+        {
+            return -RT_EINVAL;
+        }
+        if (target_page == current_page)
+        {
+            return RT_EOK;
+        }
+
         return ui_page_show(target_page);
+
     case UI_ACTION_BACK:
         /*
          * 这里必须使用ui_page_back_id()：
@@ -354,8 +587,7 @@ rt_err_t ui_page_handle_event(const ui_event_t *event)
          * MENU        -> WATCHFACE
          * WATCHFACE   -> WATCHFACE
          */
-        target_page = ui_page_back_id(
-            g_ui_page_context.stats.current_page);
+        target_page = ui_page_back_id(current_page);
 
         if (ui_page_id_is_valid(target_page) != RT_TRUE)
         {
@@ -515,10 +747,10 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     lv_obj_t *title;
     lv_obj_t *time_label;
     lv_obj_t *status_label;
-    lv_obj_t *nav_button;
     lv_obj_t *date_label = RT_NULL;
     lv_obj_t *clock_state_label = RT_NULL;
     rt_err_t result = -RT_ENOMEM;
+    lv_obj_t *motion_label = RT_NULL;
     /* 父对象必须是已经创建成功的根screen。 */
     if (parent == RT_NULL)
     {
@@ -534,7 +766,8 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
         (g_ui_page_context.watchface_time != RT_NULL) ||
         (g_ui_page_context.watchface_status != RT_NULL) ||
         (g_ui_page_context.watchface_date != RT_NULL) ||
-        (g_ui_page_context.watchface_clock_state != RT_NULL))
+        (g_ui_page_context.watchface_clock_state != RT_NULL) ||
+        (g_ui_page_context.watchface_motion_label != RT_NULL))
     {
         return -RT_EBUSY;
     }
@@ -543,7 +776,6 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     title = RT_NULL;
     time_label = RT_NULL;
     status_label = RT_NULL;
-    nav_button = RT_NULL;
     /*
      * 1. 创建表盘页面容器。
      * 三个页面都应是root screen下相互独立的container。
@@ -674,23 +906,34 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
 
     /* 后续对象创建失败仍按内存不足处理。 */
     result = -RT_ENOMEM;
-    /*
-    * 8. 创建表盘页NEXT按钮。
-    *
-    * 点击回调只上报UI_ACTION_NEXT，
-    * 不允许在LVGL回调中直接调用ui_page_show()。
-    */
-    nav_button = ui_page_create_nav_button(
-        page,
-        "NEXT",
-        LV_ALIGN_BOTTOM_RIGHT,
-        -18,
-        &g_ui_nav_next);
 
-    if (nav_button == RT_NULL)
+    motion_label = lv_label_create(page);
+    if (motion_label == RT_NULL)
     {
         goto create_failed;
     }
+
+    lv_obj_set_width(motion_label, LV_PCT(90));
+    lv_label_set_long_mode(motion_label, LV_LABEL_LONG_WRAP);
+
+    lv_ext_set_local_font(
+        motion_label,
+        FONT_SMALL,
+        lv_color_hex(0xA8B0BA));
+
+    lv_obj_set_style_text_align(
+        motion_label,
+        LV_TEXT_ALIGN_CENTER,
+        LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_clear_flag(
+        motion_label,
+        LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_add_flag(motion_label, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    lv_label_set_text(motion_label, "本次启动: --");
+    lv_obj_align(motion_label, LV_ALIGN_BOTTOM_MID, 0, -12);
     /*
      * 9. 全部对象创建成功后再写入全局上下文。
      * 这样其他函数不会观察到一个只创建了一半的页面。
@@ -701,6 +944,7 @@ static rt_err_t ui_page_create_watchface(lv_obj_t *parent)
     g_ui_page_context.watchface_status = status_label;
     g_ui_page_context.watchface_date = date_label;
     g_ui_page_context.watchface_clock_state = clock_state_label;
+    g_ui_page_context.watchface_motion_label = motion_label;
     g_ui_page_context.watchface_clock_cached = RT_FALSE;
     return RT_EOK;
 
@@ -727,6 +971,7 @@ create_failed:
     g_ui_page_context.watchface_status = RT_NULL;
     g_ui_page_context.watchface_date = RT_NULL;
     g_ui_page_context.watchface_clock_state = RT_NULL;
+    g_ui_page_context.watchface_motion_label = RT_NULL;
     g_ui_page_context.watchface_clock_cached = RT_FALSE;
 
     return result;
@@ -751,8 +996,9 @@ static rt_err_t ui_page_create_menu(lv_obj_t *parent)
 {
     lv_obj_t *page;
     lv_obj_t *title;
-    lv_obj_t *items;
+    lv_obj_t *list;
     lv_obj_t *nav_button;
+    rt_uint32_t index;
 
     /* 父对象必须是有效的根screen。 */
     if (parent == RT_NULL)
@@ -766,14 +1012,14 @@ static rt_err_t ui_page_create_menu(lv_obj_t *parent)
      */
     if ((g_ui_page_context.menu_page != RT_NULL) ||
         (g_ui_page_context.menu_title != RT_NULL) ||
-        (g_ui_page_context.menu_items != RT_NULL))
+        (g_ui_page_context.menu_list != RT_NULL))
     {
         return -RT_EBUSY;
     }
 
     page = RT_NULL;
     title = RT_NULL;
-    items = RT_NULL;
+    list = RT_NULL;
     nav_button = RT_NULL;
     /*
      * 1. 创建菜单页面container。
@@ -856,66 +1102,44 @@ static rt_err_t ui_page_create_menu(lv_obj_t *parent)
         0,
         36);
 
-    /*
-     * 6. 使用一个多行label显示三个静态入口。
-     * 当前这些文字不对应按钮，也不会触发真实业务。
-     */
-    items = lv_label_create(page);
-    if (items == RT_NULL)
+
+    list = lv_list_create(page);
+    if (list == RT_NULL)
     {
         goto create_failed;
     }
 
-    lv_label_set_text(
-        items,
-        "System Info\n"
-        "Settings\n"
-        "Diagnostics");
- /*
-     * 设置label宽度和换行方式。
-     * 即使后续字符串稍微变长，也不会直接越过页面边界。
-     */
-    lv_obj_set_width(items, LV_PCT(85));
-    lv_label_set_long_mode(items, LV_LABEL_LONG_WRAP);
-    /*
-     * 菜单文字居中，并增加行间距，
-     * 让三个静态入口在视觉 上容易区分。
-     */
-    lv_obj_set_style_text_align(
-        items,
-        LV_TEXT_ALIGN_CENTER,
-        LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_size(list, LV_PCT(85), 212);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 100);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
 
-    lv_obj_set_style_text_line_space(
-        items,
-        18,
-        LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_ext_set_local_font(
-        items,
-        FONT_NORMAL,
-        lv_color_hex(0xD8DEE8));
-
-    lv_obj_align(
-        items,
-        LV_ALIGN_CENTER,
-        0,
-        20);
-
-    /*
-    * 7. 创建菜单页HOME按钮。
-    * HOME固定在左侧，保持三个页面的触摸位置一致。
-    */
-    nav_button = ui_page_create_nav_button(
-        page,
-        "HOME",
-        LV_ALIGN_BOTTOM_LEFT,
-        18,
-        &g_ui_nav_home);
-
-    if (nav_button == RT_NULL)
+    for (index = 0U; index < sizeof(g_ui_menu_items) / sizeof(g_ui_menu_items[0]); index++)
     {
-        goto create_failed;
+        lv_obj_t *row;
+        lv_obj_t *label;
+
+        row = lv_list_add_btn(list, NULL, NULL);
+        if (row == RT_NULL)
+        {
+            goto create_failed;
+        }
+
+        lv_obj_set_height(row, 80);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_PRESS_LOCK);
+
+        label = lv_label_create(row);
+        if (label == RT_NULL)
+        {
+            goto create_failed;
+        }
+        lv_label_set_text(label, g_ui_menu_items[index].label);
+        lv_ext_set_local_font(label, FONT_NORMAL, lv_obj_get_style_text_color(row, LV_PART_MAIN));
+
+        if (lv_obj_add_event_cb(row, ui_page_menu_row_event_cb, LV_EVENT_ALL, (void *)&g_ui_menu_items[index]) == NULL)
+        {
+            goto create_failed;
+        }
     }
 
     /*
@@ -934,26 +1158,12 @@ static rt_err_t ui_page_create_menu(lv_obj_t *parent)
     }
 
     /*
-    * 9. 创建菜单页NEXT按钮。
-    */
-    nav_button = ui_page_create_nav_button(
-        page,
-        "NEXT",
-        LV_ALIGN_BOTTOM_RIGHT,
-        -18,
-        &g_ui_nav_next);
-
-    if (nav_button == RT_NULL)
-    {
-        goto create_failed;
-    }
-    /*
      * 10. 全部创建成功后再提交到全局上下文。
      * 避免其他函数看到只创建了一部分的菜单页面。
      */
     g_ui_page_context.menu_page = page;
     g_ui_page_context.menu_title = title;
-    g_ui_page_context.menu_items = items;
+    g_ui_page_context.menu_list = list;
 
     return RT_EOK;
 
@@ -970,7 +1180,7 @@ create_failed:
 
     g_ui_page_context.menu_page = RT_NULL;
     g_ui_page_context.menu_title = RT_NULL;
-    g_ui_page_context.menu_items = RT_NULL;
+    g_ui_page_context.menu_list = RT_NULL;
 
     return -RT_ENOMEM;
 
@@ -1190,21 +1400,6 @@ static rt_err_t ui_page_create_system_info(lv_obj_t *parent)
         88);
 
     /*
-    * 9. 创建系统信息页HOME按钮。
-    */
-    nav_button = ui_page_create_nav_button(
-        page,
-        "HOME",
-        LV_ALIGN_BOTTOM_LEFT,
-        18,
-        &g_ui_nav_home);
-
-    if (nav_button == RT_NULL)
-    {
-        goto create_failed;
-    }
-
-    /*
     * 10. 创建系统信息页BACK按钮。
     *
     * BACK始终位于底部中间，
@@ -1221,22 +1416,7 @@ static rt_err_t ui_page_create_system_info(lv_obj_t *parent)
     {
         goto create_failed;
     }
-    /*
-     * 创建NEXT按钮，使触摸导航可以从系统信息页进入传感器诊断页。
-     * 按钮只产生统一UI_ACTION_NEXT语义，
-     * 页面回调不直接修改current_page。
-     */
-    nav_button = ui_page_create_nav_button(
-        page,
-        "NEXT",
-        LV_ALIGN_BOTTOM_RIGHT,
-        -18,
-        &g_ui_nav_next);
 
-    if (nav_button == RT_NULL)
-    {
-        goto create_failed;
-    }
     /*
      * 11. 全部对象创建成功后再提交到全局上下文，
      * 避免其他函数看到创建了一半的页面。
@@ -1502,18 +1682,6 @@ static rt_err_t ui_page_create_sensor_diag(lv_obj_t *parent)
 
     nav_button = ui_page_create_nav_button(
         page,
-        "HOME",
-        LV_ALIGN_BOTTOM_LEFT,
-        18,
-        &g_ui_nav_home);
-
-    if (nav_button == RT_NULL)
-    {
-        goto create_failed;
-    }
-
-    nav_button = ui_page_create_nav_button(
-        page,
         "BACK",
         LV_ALIGN_BOTTOM_MID,
         0,
@@ -1674,6 +1842,8 @@ static void ui_page_cleanup(void)
     lv_timer_t *sensor_diag_timer;
     rt_uint32_t device_index;
     lv_timer_t *watchface_timer;
+    lv_timer_t *motion_refresh_timer;
+    lv_timer_t *notice_timer;
     rt_base_t level;
     /*
      * 先保存根对象。
@@ -1682,6 +1852,8 @@ static void ui_page_cleanup(void)
     root_screen = g_ui_page_context.root_screen;
     sensor_diag_timer =g_ui_page_context.sensor_diag_timer;
     watchface_timer = g_ui_page_context.watchface_timer;
+    motion_refresh_timer = g_ui_page_context.motion_refresh_timer;
+    notice_timer = g_ui_page_context.notice_timer;
 
     //开始清空上下文前，将页面标记为不可用
     level = rt_hw_interrupt_disable();
@@ -1705,6 +1877,9 @@ static void ui_page_cleanup(void)
     g_ui_page_context.watchface_date = RT_NULL;
     g_ui_page_context.watchface_clock_state = RT_NULL;
     g_ui_page_context.watchface_timer = RT_NULL;
+    g_ui_page_context.watchface_motion_label = RT_NULL;
+    g_ui_page_context.motion_body_label = RT_NULL;
+    g_ui_page_context.motion_refresh_timer = RT_NULL;
 
     g_ui_page_context.watchface_clock_cached = RT_FALSE;
 
@@ -1712,7 +1887,51 @@ static void ui_page_cleanup(void)
 
     g_ui_page_context.menu_page = RT_NULL;
     g_ui_page_context.menu_title = RT_NULL;
-    g_ui_page_context.menu_items = RT_NULL;
+    g_ui_page_context.menu_list = RT_NULL;
+
+    /* 清除菜单本次按压留下的状态。 */
+    g_ui_page_context.menu_pressed_row = RT_NULL;
+    g_ui_page_context.menu_press_start.x = 0;
+    g_ui_page_context.menu_press_start.y = 0;
+    g_ui_page_context.menu_press_dragged = RT_FALSE;
+
+    g_ui_page_context.motion_page = RT_NULL;
+    g_ui_page_context.recent_notifications_page = RT_NULL;
+    g_ui_page_context.recent_notice_content = RT_NULL;
+    g_ui_page_context.recent_notice_title = RT_NULL;
+    g_ui_page_context.recent_notice_body = RT_NULL;
+
+        /* 最近通知记录和显示缓冲。 */
+    memset(&g_ui_page_context.latest_notice, 0,
+        sizeof(g_ui_page_context.latest_notice));
+
+    g_ui_page_context.has_latest_notice = RT_FALSE;
+    g_ui_page_context.recent_notice_dirty = RT_FALSE;
+
+    g_ui_page_context.recent_title_text[0] = '\0';
+    g_ui_page_context.recent_body_text[0] = '\0';
+    g_ui_page_context.overlay_title_text[0] = '\0';
+    g_ui_page_context.overlay_body_text[0] = '\0';
+
+    /* 弹层对象由根屏递归释放，这里先撤销上下文引用。 */
+    g_ui_page_context.notice_overlay = RT_NULL;
+    g_ui_page_context.notice_overlay_title = RT_NULL;
+    g_ui_page_context.notice_overlay_body = RT_NULL;
+    g_ui_page_context.notice_close_button = RT_NULL;
+    g_ui_page_context.notice_timer = RT_NULL;
+
+    /* 清除显示身份及尚未结束的按压。 */
+    g_ui_page_context.notice_visible = RT_FALSE;
+    g_ui_page_context.notice_return_page = UI_PAGE_COUNT;
+    g_ui_page_context.notice_display_id = 0U;
+    g_ui_page_context.notice_pressed_close_id = 0U;
+    g_ui_page_context.notice_deadline = 0;
+
+    g_ui_page_context.notice_close_press_start.x = 0;
+    g_ui_page_context.notice_close_press_start.y = 0;
+    g_ui_page_context.notice_close_dragged = RT_FALSE;
+
+    g_ui_page_context.settings_page = RT_NULL;
 
     g_ui_page_context.system_info_page = RT_NULL;
     g_ui_page_context.system_info_title = RT_NULL;
@@ -1750,10 +1969,21 @@ static void ui_page_cleanup(void)
     {
         lv_timer_del(watchface_timer);
     }
+
+    if (motion_refresh_timer != RT_NULL)
+    {
+        lv_timer_del(motion_refresh_timer);
+    }
+
+    if (notice_timer != RT_NULL)
+    {
+        lv_timer_del(notice_timer);
+    }
+
     /*
-     * root_screen是所有页面的共同父对象。
-     * 删除它即可递归释放四个页面及其标签。
-     */
+    * 根屏拥有七个页面容器和通知遮罩。
+    * 删除根屏会递归释放它们及其子对象。
+    */
     if (root_screen != RT_NULL)
     {
         lv_obj_del(root_screen);
@@ -1786,8 +2016,17 @@ static void ui_page_cleanup(void)
  */
 static rt_err_t ui_page_apply_visibility(ui_page_id_t target)
 {
-
-    lv_obj_t *target_page = RT_NULL;
+    lv_obj_t *const pages[UI_PAGE_COUNT] =
+    {
+        [UI_PAGE_WATCHFACE] = g_ui_page_context.watchface_page,
+        [UI_PAGE_MENU] = g_ui_page_context.menu_page,
+        [UI_PAGE_SYSTEM_INFO] = g_ui_page_context.system_info_page,
+        [UI_PAGE_SENSOR_DIAG] = g_ui_page_context.sensor_diag_page,
+        [UI_PAGE_MOTION] = g_ui_page_context.motion_page,
+        [UI_PAGE_RECENT_NOTIFICATIONS] = g_ui_page_context.recent_notifications_page,
+        [UI_PAGE_SETTINGS] = g_ui_page_context.settings_page
+    };
+    rt_uint32_t index;
 
     if(ui_page_id_is_valid(target)!=RT_TRUE)
     {
@@ -1799,58 +2038,28 @@ static rt_err_t ui_page_apply_visibility(ui_page_id_t target)
      * 确认根screen和四个页面对象都已经完整创建。
      */
     if ((g_ui_page_context.root_screen == RT_NULL) ||
-        (g_ui_page_context.watchface_page == RT_NULL) ||
-        (g_ui_page_context.menu_page == RT_NULL) ||
-        (g_ui_page_context.system_info_page == RT_NULL) ||
-        (g_ui_page_context.sensor_diag_page == RT_NULL) ||
         (g_ui_page_context.sensor_diag_timer == RT_NULL))
     {
         return -RT_ERROR;
     }
 
-    /* 先把页面ID转换为具体对象。 */
-    switch (target)
+    /* 先检查所有容器，避免切到一半才发现页面缺失。 */
+    for (index = 0U; index < (rt_uint32_t)UI_PAGE_COUNT; index++)
     {
-    case UI_PAGE_WATCHFACE:
-        target_page = g_ui_page_context.watchface_page;
-        break;
-
-    case UI_PAGE_MENU:
-        target_page = g_ui_page_context.menu_page;
-        break;
-
-    case UI_PAGE_SYSTEM_INFO:
-        target_page = g_ui_page_context.system_info_page;
-        break;
-    case UI_PAGE_SENSOR_DIAG:
-        target_page = g_ui_page_context.sensor_diag_page;
-        break;
-    default:
-        /* 防御性分支，正常情况下前面的ID检查已经拦截。 */
-        return -RT_EINVAL;
+        if (pages[index] == RT_NULL)
+        {
+            return -RT_ERROR;
+        }
     }
-
-    /*
-     * 所有可能失败的校验已经完成。
-     * 从这里开始不会出现“隐藏一半后返回失败”的状态。
-     */
-    lv_obj_add_flag(
-        g_ui_page_context.watchface_page,
-        LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_add_flag(
-        g_ui_page_context.menu_page,
-        LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_add_flag(
-        g_ui_page_context.system_info_page,
-        LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(
-        g_ui_page_context.sensor_diag_page,
-        LV_OBJ_FLAG_HIDDEN);
-    /* 唯一显示目标页面。 */
-    lv_obj_clear_flag(target_page, LV_OBJ_FLAG_HIDDEN);
-
+    /* 隐藏其他页面，最后显示目标页。 */
+    for (index = 0U; index < (rt_uint32_t)UI_PAGE_COUNT; index++)
+    {
+        if (index != (rt_uint32_t)target)
+        {
+            lv_obj_add_flag(pages[index], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    lv_obj_clear_flag(pages[target], LV_OBJ_FLAG_HIDDEN);
 
     return RT_EOK;
 
@@ -1891,8 +2100,7 @@ static rt_err_t ui_page_show(ui_page_id_t target)
      * 同时验证目标页面和当前状态。
      * current_page异常时不能继续推导NEXT或BACK。
      */
-    if(ui_page_id_is_valid(target)!=RT_TRUE||
-        ui_page_id_is_valid(g_ui_page_context.stats.current_page)!=RT_TRUE)
+    if(ui_page_id_is_valid(target)!=RT_TRUE|| ui_page_id_is_valid(g_ui_page_context.stats.current_page)!=RT_TRUE)
     {
         ui_page_stat_increment(&g_ui_page_context.stats.switch_fail);
         return -RT_EINVAL;
@@ -1926,6 +2134,14 @@ static rt_err_t ui_page_show(ui_page_id_t target)
         return result;
     }
 
+    /* 已成功离开菜单，作废切页前尚未结束的按压。 */
+    if (old_page == UI_PAGE_MENU && target != UI_PAGE_MENU)
+    {
+        g_ui_page_context.menu_pressed_row = RT_NULL;
+        g_ui_page_context.menu_press_start.x = 0;
+        g_ui_page_context.menu_press_start.y = 0;
+        g_ui_page_context.menu_press_dragged = RT_FALSE;
+    }
     /*
      * 视觉切换成功后，再提交权威页面状态和成功计数。
      * 临界区内部直接递增，避免再次嵌套关闭中断。
@@ -1935,6 +2151,11 @@ static rt_err_t ui_page_show(ui_page_id_t target)
     g_ui_page_context.stats.switch_success++;
     rt_hw_interrupt_enable(level);
 
+    if (target == UI_PAGE_RECENT_NOTIFICATIONS)
+    {
+        (void)ui_page_refresh_recent_notification();
+    }
+
     if ((target == UI_PAGE_WATCHFACE) && (g_ui_page_context.watchface_timer != RT_NULL))
     {
         g_ui_page_context.watchface_clock_cached = RT_FALSE;
@@ -1942,6 +2163,13 @@ static rt_err_t ui_page_show(ui_page_id_t target)
         (void)ui_page_refresh_clock();
 
         lv_timer_reset(g_ui_page_context.watchface_timer);
+    }
+
+    if ((target == UI_PAGE_WATCHFACE || target == UI_PAGE_MOTION) && g_ui_page_context.motion_refresh_timer != RT_NULL)
+    {
+        (void)ui_page_refresh_motion();
+
+        lv_timer_reset(g_ui_page_context.motion_refresh_timer);
     }
     /*
      * 进入诊断页时立即读取一次最新快照，
@@ -1967,55 +2195,41 @@ static rt_err_t ui_page_show(ui_page_id_t target)
 }
 
 
-
-/*简介：获取下一个页面ID
-  输入: current: 当前页面id
-  返回值：ui_page_id_t：下一个页面ID
-        合法时返回下一个页面ID；
-        非法时返回UI_PAGE_COUNT作为无效哨兵值。
-*/
-static ui_page_id_t ui_page_next_id(ui_page_id_t current)
+/*
+ * 简介：根据来源页和横滑方向计算目标。
+ * 输入：current为来源页，action为左滑或右滑动作。
+ * 返回值：目标页，向外滑返回原页，非法输入返回UI_PAGE_COUNT。
+ * 说明：左滑指手指从右向左。由事件消费点执行切页。
+ */
+static ui_page_id_t ui_page_swipe_target(ui_page_id_t current, ui_action_t action)
 {
-    if(ui_page_id_is_valid(current)!=RT_TRUE)
+    if (action != UI_ACTION_SWIPE_LEFT && action != UI_ACTION_SWIPE_RIGHT)
     {
         return UI_PAGE_COUNT;
     }
 
-    /*
-     * 页面循环顺序：
-     * WATCHFACE   -> MENU
-     * MENU        -> SYSTEM_INFO
-     * SYSTEM_INFO -> SENSOR_DIAG
-     * SENSOR_DIAG -> WATCHFACE
-     */
     switch (current)
     {
     case UI_PAGE_WATCHFACE:
-        return UI_PAGE_MENU;
+        return action == UI_ACTION_SWIPE_LEFT ? UI_PAGE_MOTION : UI_PAGE_RECENT_NOTIFICATIONS;
 
-    case UI_PAGE_MENU:
-        return UI_PAGE_SYSTEM_INFO;
+    case UI_PAGE_MOTION:
+        return action == UI_ACTION_SWIPE_RIGHT ? UI_PAGE_WATCHFACE : UI_PAGE_MOTION;
 
-    case UI_PAGE_SYSTEM_INFO:
-        return UI_PAGE_SENSOR_DIAG;
-
-    case UI_PAGE_SENSOR_DIAG:
-        return UI_PAGE_WATCHFACE;
+    case UI_PAGE_RECENT_NOTIFICATIONS:
+        return action == UI_ACTION_SWIPE_LEFT ? UI_PAGE_WATCHFACE : UI_PAGE_RECENT_NOTIFICATIONS;
 
     default:
         return UI_PAGE_COUNT;
     }
-
-
 }
 
-/*简介：获取返回页面ID
-  输入: current: 当前页面id
-  返回值：ui_page_id_t：上一个页面ID
-        合法时返回上一个页面ID；
-        非法时返回UI_PAGE_COUNT作为无效哨兵值。
-
-*/
+/*
+ * 简介：根据当前页面计算返回目标。
+ * 输入：current为当前页面ID。
+ * 返回值：目标页面ID，非法页面返回UI_PAGE_COUNT。
+ * 说明：只计算目标，不修改页面状态。
+ */
 static ui_page_id_t ui_page_back_id(ui_page_id_t current)
 {
     if(ui_page_id_is_valid(current)!=RT_TRUE)
@@ -2023,31 +2237,181 @@ static ui_page_id_t ui_page_back_id(ui_page_id_t current)
         return UI_PAGE_COUNT;
     }
 
-     /*
-     * 页面返回层级：
-     * WATCHFACE   -> WATCHFACE
-     * MENU        -> WATCHFACE
-     * SYSTEM_INFO -> MENU
-     * SENSOR_DIAG -> SYSTEM_INFO
-     */
-    switch (current)
+      switch (current)
     {
-    case UI_PAGE_WATCHFACE:
-        return UI_PAGE_WATCHFACE;
-
-    case UI_PAGE_MENU:
-        return UI_PAGE_WATCHFACE;
-
+    case UI_PAGE_SENSOR_DIAG:
+    case UI_PAGE_SETTINGS:
     case UI_PAGE_SYSTEM_INFO:
         return UI_PAGE_MENU;
 
-    case UI_PAGE_SENSOR_DIAG:
-        return UI_PAGE_SYSTEM_INFO;
+    case UI_PAGE_MENU:
+    case UI_PAGE_MOTION:
+    case UI_PAGE_RECENT_NOTIFICATIONS:
+    case UI_PAGE_WATCHFACE:
+        return UI_PAGE_WATCHFACE;
 
     default:
         return UI_PAGE_COUNT;
     }
 
+}
+
+/*
+ * 简介：向UI队列提交一个触摸动作，并记录投递结果。
+ * 输入：action为动作类型，value按动作约定携带页面ID或零。
+ * 返回值：无。
+ * 说明：在UI触摸回调中调用。成功表示入队，切页由消费点完成。
+ */
+static void ui_page_post_touch_action(ui_action_t action, rt_uint32_t value)
+{
+    rt_err_t result;
+
+    ui_page_stat_increment(&g_ui_page_context.stats.touch_action_attempt);
+
+    if (g_ui_page_context.action_handler == RT_NULL)
+    {
+        ui_page_stat_increment(&g_ui_page_context.stats.touch_action_fail);
+        return;
+    }
+
+    result = g_ui_page_context.action_handler(action, rt_tick_get(), value, g_ui_page_context.action_user_data);
+
+    if (result == RT_EOK)
+    {
+        ui_page_stat_increment(&g_ui_page_context.stats.touch_action_success);
+    }
+    else
+    {
+        ui_page_stat_increment(&g_ui_page_context.stats.touch_action_fail);
+        rt_kprintf("[UI][TOUCH_NAV][WARN] action=%d post failed: %d\n",
+                   (int)action, (int)result);
+    }
+}
+
+/*
+ * 简介：区分菜单行短点击与拖动。
+ * 输入：event为LVGL事件，user_data指向静态菜单条目。
+ * 返回值：无。
+ * 说明：仅UI线程调用。有效短点击只提交详情动作。
+ */
+static void ui_page_menu_row_event_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t *row;
+    lv_indev_t *indev;
+    const ui_menu_item_t *item;
+    lv_point_t point;
+    int dx;
+    int dy;
+    rt_bool_t clicked;
+
+    if (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING &&
+        code != LV_EVENT_PRESS_LOST && code != LV_EVENT_SHORT_CLICKED)
+    {
+        return;
+    }
+
+    //按下滑出控件边界，按压丢失意味着这次点选资格已取消
+    row = lv_event_get_current_target(event);
+    if (code == LV_EVENT_PRESS_LOST)
+    {
+        if (g_ui_page_context.menu_pressed_row == row)
+        {
+            g_ui_page_context.menu_pressed_row = RT_NULL;
+            g_ui_page_context.menu_press_dragged = RT_FALSE;
+        }
+        return;
+    }
+    /*
+     * 后面的PRESSING和SHORT_CLICKED必须与起始按压属于同一行。
+     * 例如切页或PRESS_LOST已清掉记录时，这里直接忽略旧事件。
+     */
+    if (g_ui_page_context.stats.current_page != UI_PAGE_MENU)
+    {
+        return;
+    }
+
+    //后续要比较坐标，因此这里只处理触摸屏这类指针输入
+    indev = lv_indev_get_act();
+    if (indev == NULL || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER)
+    {
+        return;
+    }
+
+    lv_indev_get_point(indev, &point);
+
+    //新按压开始。保存最初按下的行和坐标，作为整个触摸过程的基准
+    if (code == LV_EVENT_PRESSED)
+    {
+        g_ui_page_context.menu_pressed_row = row;
+        g_ui_page_context.menu_press_start = point;
+        g_ui_page_context.menu_press_dragged = RT_FALSE;
+        return;
+    }
+
+    if (g_ui_page_context.menu_pressed_row != row)
+    {
+        return;
+    }
+
+    //在按压过程中持续检查位移，收到SHORT_CLICKED时再检查一次
+    dx = (int)point.x - (int)g_ui_page_context.menu_press_start.x;
+    dy = (int)point.y - (int)g_ui_page_context.menu_press_start.y;
+    if (dx > UI_MENU_TAP_SLOP_PX || dx < -UI_MENU_TAP_SLOP_PX ||
+        dy > UI_MENU_TAP_SLOP_PX || dy < -UI_MENU_TAP_SLOP_PX ||
+        lv_indev_get_scroll_obj(indev) != NULL)
+    {
+        g_ui_page_context.menu_press_dragged = RT_TRUE;
+    }
+
+    if (code == LV_EVENT_SHORT_CLICKED)
+    {
+        item = (const ui_menu_item_t *)lv_event_get_user_data(event);
+        clicked = (g_ui_page_context.menu_press_dragged == RT_FALSE);
+        g_ui_page_context.menu_pressed_row = RT_NULL;
+        g_ui_page_context.menu_press_dragged = RT_FALSE;
+
+        if (clicked == RT_TRUE && item != NULL)
+        {
+            ui_page_post_touch_action(UI_ACTION_OPEN_DETAIL, (rt_uint32_t)item->target);
+        }
+    }
+}
+
+/*
+ * 简介：将水平手势转换为带来源页的UI动作。
+ * 输入：event为LVGL手势事件，user_data指向静态页面ID。
+ * 返回值：无。
+ * 说明：仅UI线程调用。识别后等待释放，切页由UI队列消费执行。
+ */
+static void ui_page_swipe_event_cb(lv_event_t *event)
+{
+    const ui_page_id_t *source_page = (const ui_page_id_t *)lv_event_get_user_data(event);
+    lv_indev_t *indev = lv_indev_get_act();
+    lv_dir_t direction;
+    ui_action_t action;
+
+    if (source_page == NULL || indev == NULL || *source_page != g_ui_page_context.stats.current_page)
+    {
+        return;
+    }
+
+    direction = lv_indev_get_gesture_dir(indev);
+    if (direction == LV_DIR_LEFT)
+    {
+        action = UI_ACTION_SWIPE_LEFT;
+    }
+    else if (direction == LV_DIR_RIGHT)
+    {
+        action = UI_ACTION_SWIPE_RIGHT;
+    }
+    else
+    {
+        return;
+    }
+
+    lv_indev_wait_release(indev);
+    ui_page_post_touch_action(action, (rt_uint32_t)*source_page);
 }
 
 /*简介：LVGL点击回调
@@ -2058,7 +2422,6 @@ static ui_page_id_t ui_page_back_id(ui_page_id_t current)
 static void ui_page_nav_event_cb(lv_event_t *event)
 {
     const ui_action_t *action;
-    rt_err_t result;
 
     if (event == RT_NULL)
     {
@@ -2080,40 +2443,7 @@ static void ui_page_nav_event_cb(lv_event_t *event)
         return;
     }
 
-    ui_page_stat_increment(
-        &g_ui_page_context.stats.touch_action_attempt);
-
-    if (g_ui_page_context.action_handler == RT_NULL)
-    {
-        ui_page_stat_increment(
-            &g_ui_page_context.stats.touch_action_fail);
-        return;
-    }
-
-    /*
-     * 重要：这里不能直接调用ui_page_show()。
-     * 触摸和按键必须进入同一个UI事件队列。
-     */
-    result = g_ui_page_context.action_handler(
-        *action,
-        rt_tick_get(),
-        g_ui_page_context.action_user_data);
-
-    if (result == RT_EOK)
-    {
-        ui_page_stat_increment(
-            &g_ui_page_context.stats.touch_action_success);
-    }
-    else
-    {
-        ui_page_stat_increment(
-            &g_ui_page_context.stats.touch_action_fail);
-
-        rt_kprintf(
-            "[UI][TOUCH_NAV][WARN] action=%d post failed: %d\n",
-            (int)*action,
-            (int)result);
-    }
+   ui_page_post_touch_action(*action, 0U);
 }
 
 /*简介：检查页面id是否有效
@@ -3646,4 +3976,1608 @@ static void ui_page_clock_timer_cb(lv_timer_t *timer)
     }
 
     (void)ui_page_refresh_clock();
+}
+
+/*
+ * 简介：创建最小页面容器及其占位文字。
+ * 输入：parent为根屏，title为页名，body可为RT_NULL。
+ *       with_back表示是否创建返回按钮，out_page指向初始为空的页面指针。
+ * 返回值：成功返回RT_EOK，参数无效返回-RT_EINVAL，
+ *         输出位置已有对象返回-RT_EBUSY，对象创建失败返回-RT_ENOMEM。
+ * 说明：仅UI线程调用。成功时由根屏拥有页面，失败时不改写输出位置。
+ */
+static rt_err_t ui_page_create_placeholder(lv_obj_t *parent,const char *title,const char *body,
+                                           rt_bool_t with_back,lv_obj_t **out_page)
+{
+    lv_obj_t *page;
+    lv_obj_t *title_label;
+    lv_obj_t *body_label;
+
+    if (parent == RT_NULL || title == RT_NULL || out_page == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+    if (*out_page != RT_NULL)
+    {
+        return -RT_EBUSY;
+    }
+
+    page = lv_obj_create(parent);
+    if (page == RT_NULL)
+    {
+        return -RT_ENOMEM;
+    }
+
+    lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(page);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+
+    title_label = lv_label_create(page);
+    if (title_label == RT_NULL)
+    {
+        goto create_failed;
+    }
+    lv_label_set_text(title_label, title);
+    lv_ext_set_local_font(title_label, FONT_TITLE, LV_COLOR_WHITE);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 24);
+
+    if (body != RT_NULL)
+    {
+        body_label = lv_label_create(page);
+        if (body_label == RT_NULL)
+        {
+            goto create_failed;
+        }
+        lv_label_set_text(body_label, body);
+        lv_ext_set_local_font(body_label, FONT_NORMAL, LV_COLOR_WHITE);
+        lv_obj_center(body_label);
+    }
+
+    if (with_back == RT_TRUE &&ui_page_create_nav_button(page, "BACK", LV_ALIGN_BOTTOM_MID,
+                                  0, &g_ui_nav_back) == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    /* 所有子对象创建成功后，才向调用者发布页面指针。 */
+    *out_page = page;
+    return RT_EOK;
+
+create_failed:
+    lv_obj_del(page);
+    return -RT_ENOMEM;
+}
+
+/*
+ * 简介：创建运动页面和可更新的详情标签。
+ * 输入：parent为有效根屏，不可为RT_NULL。
+ * 返回值：成功返回RT_EOK，参数无效返回-RT_EINVAL，
+ *         已有运动对象返回-RT_EBUSY，分配失败返回-RT_ENOMEM。
+ * 说明：仅UI线程调用。全部成功后提交上下文指针。
+ *       页面归根屏所有，正文标签归页面所有。
+ */
+static rt_err_t ui_page_create_motion(lv_obj_t *parent)
+{
+    lv_obj_t *page = RT_NULL;
+    lv_obj_t *body_label;
+    rt_err_t result;
+
+    if (parent == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    /* 任一对象已存在，都不能再次创建。 */
+    if ((g_ui_page_context.motion_page != RT_NULL) || (g_ui_page_context.motion_body_label != RT_NULL))
+    {
+        return -RT_EBUSY;
+    }
+
+    /*
+     * 工厂创建容器和标题，先输出到局部指针。
+     * 正文由本函数创建，以便保存可更新的标签句柄。
+     */
+    result = ui_page_create_placeholder( parent, "运动", RT_NULL, RT_FALSE, &page);
+
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    body_label = lv_label_create(page);
+    if (body_label == RT_NULL)
+    {
+        /* 同时释放工厂创建的标题等子对象。 */
+        lv_obj_del(page);
+        return -RT_ENOMEM;
+    }
+
+    lv_obj_set_width(body_label, LV_PCT(88));
+    lv_label_set_long_mode(body_label, LV_LABEL_LONG_WRAP);
+
+    lv_ext_set_local_font( body_label,
+                            FONT_NORMAL,
+                            LV_COLOR_WHITE);
+
+    lv_obj_set_style_text_align( body_label,
+                                LV_TEXT_ALIGN_LEFT,
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    /*
+     * 正文只显示信息，触摸手势继续交给页面容器处理。
+     */
+    lv_obj_clear_flag( body_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_add_flag(body_label, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    lv_label_set_text( body_label,
+                        "今日步数: --\n"
+                        "本次启动: --\n"
+                        "状态: 等待数据");
+
+    /* 标题在顶部24px附近，正文从100px开始。 */
+    lv_obj_align(body_label, LV_ALIGN_TOP_MID, 0, 100);
+
+    /* 所有对象创建完成后，才向页面上下文提交。 */
+    g_ui_page_context.motion_page = page;
+    g_ui_page_context.motion_body_label = body_label;
+
+    return RT_EOK;
+}
+/*
+ * 简介：把64位无符号计数转换为十进制字符串。
+ * 输入：value为待转换值，buffer为非空输出，capacity至少为21字节。
+ * 返回值：RT_EOK或-RT_EINVAL。
+ * 说明：支持0到UINT64_MAX。最多20位数字，另留字符串终止符。
+ *       输出由调用者持有，本函数不分配内存。
+ */
+static rt_err_t ui_page_u64_to_decimal(uint64_t value,
+                                      char *buffer,
+                                      size_t capacity)
+{
+    char reversed[20];
+    size_t count = 0U;
+    size_t index;
+
+    if (buffer == RT_NULL || capacity < 21U)
+    {
+        return -RT_EINVAL;
+    }
+
+    /* 至少执行一次，让数值0得到字符串"0"。 */
+    do
+    {
+        reversed[count] = (char)('0' + (unsigned int)(value % 10U));
+        count++;
+        value /= 10U;
+    }
+    while (value != 0U);
+
+    for (index = 0U; index < count; index++)
+    {
+        buffer[index] = reversed[count - 1U - index];
+    }
+
+    buffer[count] = '\0';
+    return RT_EOK;
+}
+
+/*
+ * 简介：刷新当前可见页面的运动信息。
+ * 输入：无。
+ * 返回值：成功或无需刷新返回RT_EOK，
+ *         快照复制失败返回接口错误，数据或格式化异常返回-RT_ERROR。
+ * 说明：仅UI线程调用。隐藏时不读取业务快照。
+ *       显示运动服务发布的计数副本，标签复制局部文字。
+ */
+static rt_err_t ui_page_refresh_motion(void)
+{
+    motion_snapshot_t motion;
+    time_snapshot_t time_value;
+    ui_page_id_t current = g_ui_page_context.stats.current_page;
+    lv_obj_t *label;
+
+    uint32_t algorithm_index;
+    rt_bool_t today_available = RT_FALSE;
+    rt_err_t result;
+
+    char boot_steps_text[21];
+    char day_steps_text[21];
+
+    const char *state_name;
+    const char *quality_name;
+    const char *previous_text;
+
+    char today_text[48] = "--";
+    char text[160];
+    int length;
+
+    /* 隐藏页不复制快照，也不更新标签。 */
+    if (g_ui_page_context.stats.created != RT_TRUE || (current != UI_PAGE_WATCHFACE && current != UI_PAGE_MOTION))
+    {
+        return RT_EOK;
+    }
+
+    label = (current == UI_PAGE_WATCHFACE) ? g_ui_page_context.watchface_motion_label : g_ui_page_context.motion_body_label;
+
+    if (label == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    result = motion_service_get_snapshot(&motion);
+    if (result != RT_EOK)
+    {
+        length = lv_snprintf( text,
+                            sizeof(text),
+                            "%s",
+                            current == UI_PAGE_WATCHFACE
+                                ? "本次启动: --"
+                                : "今日步数: --\n本次启动: --\n状态: 数据暂不可用");
+
+        goto render_text;
+    }
+
+    /*
+     * 在任何数组索引之前检查算法编号。
+     * 转为无符号后，负数或越界枚举同样会被拒绝。
+     */
+    algorithm_index = (uint32_t)motion.selected_algorithm;
+
+    if (motion.format_version != MOTION_FORMAT_VERSION || algorithm_index >= MOTION_ALGORITHM_COUNT)
+    {
+        result = -RT_ERROR;
+
+        length = lv_snprintf(
+            text,
+            sizeof(text),
+            "%s",
+            current == UI_PAGE_WATCHFACE
+                ? "本次启动: --"
+                : "今日步数: --\n本次启动: --\n状态: 运动数据异常");
+
+        goto render_text;
+    }
+
+    result = ui_page_u64_to_decimal(motion.totals[algorithm_index].boot_steps,
+                                    boot_steps_text,
+                                    sizeof(boot_steps_text));
+
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    /*
+     * 表盘只展示本次启动累计。
+     * 今日归属的检查留给运动详情页。
+     */
+    if (current == UI_PAGE_WATCHFACE)
+    {
+        length = lv_snprintf(
+            text,
+            sizeof(text),
+            "本次启动: %s",
+            boot_steps_text);
+
+        goto render_text;
+    }
+
+    /*
+     * 服务状态与数据质量分开显示。
+     * RUNNING不代表样本一定连续或新鲜。
+     */
+    switch (motion.state)
+    {
+    case MOTION_SERVICE_BOOT:
+        state_name = "BOOT";
+        break;
+
+    case MOTION_SERVICE_STOPPED:
+        state_name = "STOPPED";
+        break;
+
+    case MOTION_SERVICE_RUNNING:
+        state_name = "RUNNING";
+        break;
+
+    case MOTION_SERVICE_FAULT:
+        state_name = "FAULT";
+        break;
+
+    default:
+        state_name = "UNKNOWN";
+        break;
+    }
+
+    /*
+     * 选一个主要质量状态作为提示，同时保留完整位图。
+     * 多个问题同时存在时，位图仍能表达全部当前标志。
+     */
+    if (motion.quality_flags & MOTION_QUALITY_COUNTER_SATURATED)
+    {
+        quality_name = "SATURATED";
+    }
+    else if (motion.quality_flags & MOTION_QUALITY_CONFIG_MISMATCH)
+    {
+        quality_name = "CONFIG";
+    }
+    else if (motion.quality_flags & MOTION_QUALITY_SOURCE_OFFLINE)
+    {
+        quality_name = "OFFLINE";
+    }
+    else if (motion.quality_flags & MOTION_QUALITY_INPUT_STALE)
+    {
+        quality_name = "STALE";
+    }
+    else if (motion.quality_flags & MOTION_QUALITY_SAMPLE_GAP)
+    {
+        quality_name = "GAP";
+    }
+    else if (motion.quality_flags & MOTION_QUALITY_WARMUP)
+    {
+        quality_name = "WARMUP";
+    }
+    else if (!motion.has_processed)
+    {
+        quality_name = "NO SAMPLE";
+    }
+    else
+    {
+        quality_name = "SEE FLAGS";
+        if (motion.quality_flags == MOTION_QUALITY_NONE)
+        {
+            quality_name = "OK";
+        }
+    }
+
+    /*
+     * 先取得运动副本，再检查当前日历。
+     * 跨日或校时后，两份副本尚未匹配时暂不显示今日数字。
+     */
+    if (motion.current_day_valid)
+    {
+        result = time_service_get_snapshot(&time_value);
+
+        if (result == RT_EOK)
+        {
+            today_available =
+                time_value.service_running &&
+                time_value.has_value &&
+                time_value.trusted &&
+                time_value.fresh &&
+                ((time_value.state == TIME_CLOCK_READY) ||
+                 (time_value.state == TIME_CLOCK_READ_ERROR)) &&
+                (time_value.local_day_key != 0U) &&
+                (time_value.local_day_key == motion.current_day_key) &&
+                (time_value.calendar_generation ==
+                 motion.calendar_generation);
+        }
+    }
+
+    if (today_available == RT_TRUE)
+    {
+        result = ui_page_u64_to_decimal(motion.current_day_steps[algorithm_index],
+                                        day_steps_text,
+                                        sizeof(day_steps_text));
+
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+
+        length = lv_snprintf(today_text,
+                            sizeof(today_text),
+                            "%s%s",
+                            day_steps_text,
+                            motion.current_day_complete ? "" : " (部分)");
+
+        if (length < 0 || (size_t)length >= sizeof(today_text))
+        {
+            return -RT_ERROR;
+        }
+    }
+
+    /*
+     * 今日不可用时today_text仍为"--"。
+     * 时间快照复制失败时，仍显示运动累计并保留result错误。
+     */
+    length = lv_snprintf(
+        text,
+        sizeof(text),
+        "算法: B%u\n"
+        "今日步数: %s\n"
+        "本次启动: %s\n"
+        "状态: %s\n"
+        "质量: %s / 0x%08lx",
+        (unsigned int)algorithm_index,
+        today_text,
+        boot_steps_text,
+        state_name,
+        quality_name,
+        (unsigned long)motion.quality_flags);
+
+render_text:
+    if (length < 0 || (size_t)length >= sizeof(text))
+    {
+        return -RT_ERROR;
+    }
+
+    previous_text = lv_label_get_text(label);
+
+    /* 避免每次定时回调都重新分配标签文字并触发布局。 */
+    if (previous_text == RT_NULL || strcmp(previous_text, text) != 0)
+    {
+        lv_label_set_text(label, text);
+    }
+
+    return result;
+}
+
+/*
+ * 简介：在低频定时点刷新可见页面的运动信息。
+ * 输入：timer由LVGL提供。
+ * 返回值：无。
+ * 说明：运行于UI线程。可见性与取快照检查集中在refresh_motion中。
+ */
+static void ui_page_motion_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    (void)ui_page_refresh_motion();
+}
+
+/*
+ * 简介：将通知文本转换为指定字体可显示的有限UTF-8文本。
+ * 输入：text指向length字节的有效文本，length为0时可为空；
+ *       length最大为UI_NOTICE_BODY_MAX_BYTES；
+ *       font为目标标签实际使用的字体；
+ *       output为可写缓冲，capacity包含终止符空间且必须大于0。
+ * 返回值：成功返回RT_EOK，参数或编码无效返回-RT_EINVAL，
+ *         输出容量不足返回-RT_EFULL，回退字符也不可用返回-RT_ERROR。
+ * 说明：仅UI线程调用。保留换行，缺字替换为?。
+ *       先准备局部副本，全部成功后写输出，失败时输出保持原值。
+ */
+static rt_err_t ui_page_prepare_notice_text(const char *text, size_t length, const lv_font_t *font, char *output, size_t capacity)
+{
+    char prepared[UI_NOTICE_BODY_MAX_BYTES + 1U];
+    size_t input_offset = 0U;
+    size_t output_offset = 0U;
+    size_t character_start;
+    size_t copy_length;
+    size_t writable;
+    const char *copy_source;
+    uint32_t codepoint;
+    uint32_t missing_count = 0U;
+    lv_font_glyph_dsc_t glyph;
+    rt_err_t result;
+    rt_base_t level;
+
+    if (font == RT_NULL || output == RT_NULL || capacity == 0U || length > UI_NOTICE_BODY_MAX_BYTES ||
+        (length > 0U && text == RT_NULL))
+    {
+        return -RT_EINVAL;
+    }
+
+    /* 同时约束调用者缓冲和局部缓冲，预留终止符空间。 */
+    writable = capacity - 1U;
+    if (writable > sizeof(prepared) - 1U)
+    {
+        writable = sizeof(prepared) - 1U;
+    }
+
+    while (input_offset < length)
+    {
+        character_start = input_offset;
+
+        result = ui_notification_decode_utf8( text, length, &input_offset, &codepoint);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+
+        /* 防御性检查，正文只允许换行这一种控制字符。 */
+        if ((codepoint < 0x20U && codepoint != 0x0AU) ||
+            (codepoint >= 0x7FU && codepoint <= 0x9FU))
+        {
+            return -RT_EINVAL;
+        }
+
+        copy_source = text + character_start;
+        copy_length = input_offset - character_start;
+
+        /* 换行由标签布局处理，无需查询可绘制字形。 */
+        if (codepoint != 0x0AU)
+        {
+            memset(&glyph, 0, sizeof(glyph));
+
+            if (!lv_font_get_glyph_dsc(font, &glyph, codepoint, 0U) || glyph.is_placeholder)
+            {
+                /* 确认回退字符本身也有可用字形。 */
+                memset(&glyph, 0, sizeof(glyph));
+
+                if (!lv_font_get_glyph_dsc(font, &glyph, (uint32_t)'?', 0U) ||
+                    glyph.is_placeholder)
+                {
+                    return -RT_ERROR;
+                }
+
+                copy_source = "?";
+                copy_length = 1U;
+                missing_count++;
+            }
+        }
+
+        /* output_offset始终不超过writable，减法不会下溢。 */
+        if (copy_length > writable - output_offset)
+        {
+            return -RT_EFULL;
+        }
+
+        memcpy(prepared + output_offset, copy_source, copy_length);
+        output_offset += copy_length;
+    }
+
+    prepared[output_offset] = '\0';
+
+    /* 全部准备成功后，再提交完整字符串。 */
+    memcpy(output, prepared, output_offset + 1U);
+
+    /* 此计数表示成功文本转换中的缺字替换次数。 */
+    level = rt_hw_interrupt_disable();
+
+    if (UINT32_MAX - g_ui_page_context.stats.notice_missing_glyph_count < missing_count)
+    {
+        g_ui_page_context.stats.notice_missing_glyph_count = UINT32_MAX;
+    }
+    else
+    {
+        g_ui_page_context.stats.notice_missing_glyph_count += missing_count;
+    }
+
+    rt_hw_interrupt_enable(level);
+
+    return RT_EOK;
+}
+
+/*
+ * 简介：创建最近通知页及其可滚动回看区域。
+ * 输入：parent为有效根屏，不可为空。
+ * 返回值：成功返回RT_EOK，参数无效返回-RT_EINVAL，
+ *         对象已存在返回-RT_EBUSY，创建失败返回相应错误。
+ * 说明：仅UI线程调用。所有对象创建成功后才提交上下文指针。
+ *       失败时删除局部页面，递归回收已创建的子对象。
+ *       本函数只创建显示对象，最近记录由通知处理入口更新。
+ */
+static rt_err_t ui_page_create_recent_notifications(lv_obj_t *parent)
+{
+    lv_obj_t *page = RT_NULL;
+    lv_obj_t *content;
+    lv_obj_t *title_label;
+    lv_obj_t *body_label;
+    rt_err_t result;
+
+    if (parent == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (g_ui_page_context.recent_notifications_page != RT_NULL ||
+        g_ui_page_context.recent_notice_content != RT_NULL ||
+        g_ui_page_context.recent_notice_title != RT_NULL ||
+        g_ui_page_context.recent_notice_body != RT_NULL)
+    {
+        return -RT_EBUSY;
+    }
+
+    /* 工厂创建页面及顶部标题，输出先接到局部变量。 */
+    result = ui_page_create_placeholder(parent, "最近通知", RT_NULL, RT_FALSE, &page);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    /* 页面承接水平手势，内容滚动由下层容器负责。 */
+    lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag( page, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    lv_obj_set_style_pad_all(page, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(page, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(page, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color( page, lv_color_hex(0x10151C), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, LV_PART_MAIN);
+
+    content = lv_obj_create(page);
+    if (content == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    /* 为390×450页面保留顶部标题和底部边距。 */
+    lv_obj_set_size(content, LV_PCT(88), 300);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 96);
+
+    lv_obj_set_style_border_width(content, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(content, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(content, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(content, 12, LV_PART_MAIN);
+
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_add_flag( content, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    /* 内容滚动到边界后，保持在当前内容区。 */
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_CHAIN);
+
+    title_label = lv_label_create(content);
+    if (title_label == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_obj_set_width(title_label, LV_PCT(100));
+    lv_label_set_long_mode(title_label, LV_LABEL_LONG_WRAP);
+    lv_ext_set_local_font(title_label, FONT_NORMAL, LV_COLOR_WHITE);
+
+    lv_obj_clear_flag(  title_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(title_label, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    body_label = lv_label_create(content);
+    if (body_label == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_obj_set_width(body_label, LV_PCT(100));
+    lv_label_set_long_mode(body_label, LV_LABEL_LONG_WRAP);
+    lv_ext_set_local_font( body_label, FONT_NORMAL, lv_color_hex(0xD8DEE8));
+
+    lv_obj_clear_flag( body_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(body_label, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    /*
+     * 显示缓冲位于静态上下文，生命周期覆盖标签。
+     * sizeof字符串字面量包含结尾的'\0'。
+     */
+    memcpy(g_ui_page_context.recent_title_text, "暂无通知", sizeof("暂无通知"));
+    g_ui_page_context.recent_body_text[0] = '\0';
+
+    lv_label_set_text_static( title_label, g_ui_page_context.recent_title_text);
+    lv_label_set_text_static( body_label, g_ui_page_context.recent_body_text);
+
+    /* 全部创建成功后，再发布对象引用。 */
+    g_ui_page_context.recent_notifications_page = page;
+    g_ui_page_context.recent_notice_content = content;
+    g_ui_page_context.recent_notice_title = title_label;
+    g_ui_page_context.recent_notice_body = body_label;
+
+    /* 首次进入时，由刷新函数核对实际最近记录。 */
+    g_ui_page_context.recent_notice_dirty = RT_TRUE;
+
+    return RT_EOK;
+
+create_failed:
+    lv_obj_del(page);
+    return -RT_ENOMEM;
+}
+
+/*
+ * 简介：根据最近通知记录刷新回看页面。
+ * 输入：无。
+ * 返回值：成功或无需更新返回RT_EOK，页面未就绪返回-RT_EBUSY，
+ *         对象缺失返回-RT_ERROR，记录或文本无效返回相应错误。
+ * 说明：仅UI线程调用。隐藏或dirty为假时跳过更新。
+ *       两段文本均准备成功后才修改显示缓冲。
+ *       更新失败保留dirty，成功后滚动回顶部并清除dirty。
+ */
+static rt_err_t ui_page_refresh_recent_notification(void)
+{
+    const ui_notice_message_t *message;
+    const lv_font_t *title_font;
+    const lv_font_t *body_font;
+
+    const char *title_source;
+    const char *body_source;
+    size_t title_length;
+    size_t body_length;
+
+    char title_candidate[UI_NOTICE_TITLE_MAX_BYTES + 1U];
+    char body_candidate[UI_NOTICE_BODY_MAX_BYTES + 1U];
+
+    rt_err_t result;
+
+    if (g_ui_page_context.stats.created != RT_TRUE)
+    {
+        return -RT_EBUSY;
+    }
+
+    /* 隐藏时保留dirty，等待下次进入页面。 */
+    if (g_ui_page_context.stats.current_page != UI_PAGE_RECENT_NOTIFICATIONS)
+    {
+        return RT_EOK;
+    }
+
+    /* 普通离开再返回时，保留原来的阅读位置。 */
+    if (g_ui_page_context.recent_notice_dirty != RT_TRUE)
+    {
+        return RT_EOK;
+    }
+
+    if (g_ui_page_context.recent_notifications_page == RT_NULL ||
+        g_ui_page_context.recent_notice_content == RT_NULL ||
+        g_ui_page_context.recent_notice_title == RT_NULL ||
+        g_ui_page_context.recent_notice_body == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    if (g_ui_page_context.has_latest_notice == RT_TRUE)
+    {
+        message = &g_ui_page_context.latest_notice;
+
+        /* 先检查长度，避免文本准备函数越过消息数组读取。 */
+        if (message->request_id == 0U ||
+            message->title_length > UI_NOTICE_TITLE_MAX_BYTES ||
+            message->body_length > UI_NOTICE_BODY_MAX_BYTES)
+        {
+            return -RT_EINVAL;
+        }
+
+        if (message->title_length > 0U)
+        {
+            title_source = message->title;
+            title_length = message->title_length;
+        }
+        else
+        {
+            /* 有记录但标题为空时，显示默认标题。 */
+            title_source = "通知";
+            title_length = sizeof("通知") - 1U;
+        }
+
+        body_source = message->body;
+        body_length = message->body_length;
+    }
+    else
+    {
+        title_source = "暂无通知";
+        title_length = sizeof("暂无通知") - 1U;
+        body_source = RT_NULL;
+        body_length = 0U;
+    }
+
+    /* 查询实际标签字体，字形检查与最终显示保持一致。 */
+    title_font = lv_obj_get_style_text_font( g_ui_page_context.recent_notice_title, LV_PART_MAIN);
+
+    body_font = lv_obj_get_style_text_font( g_ui_page_context.recent_notice_body, LV_PART_MAIN);
+
+    result = ui_page_prepare_notice_text( title_source, title_length, title_font, title_candidate, sizeof(title_candidate));
+
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    result = ui_page_prepare_notice_text( body_source, body_length, body_font, body_candidate, sizeof(body_candidate));
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    /* 两段文本都准备成功后，统一提交到持久显示缓冲。 */
+    memcpy(g_ui_page_context.recent_title_text,
+           title_candidate, strlen(title_candidate) + 1U);
+
+    memcpy(g_ui_page_context.recent_body_text,
+           body_candidate, strlen(body_candidate) + 1U);
+
+    lv_label_set_text_static(
+        g_ui_page_context.recent_notice_title,
+        g_ui_page_context.recent_title_text);
+
+    lv_label_set_text_static(
+        g_ui_page_context.recent_notice_body,
+        g_ui_page_context.recent_body_text);
+
+    /* 先更新文本布局，再按新内容范围复位滚动位置。 */
+    lv_obj_update_layout(g_ui_page_context.recent_notice_content);
+    lv_obj_scroll_to_y( g_ui_page_context.recent_notice_content, 0, LV_ANIM_OFF);
+
+    g_ui_page_context.recent_notice_dirty = RT_FALSE;
+
+    return RT_EOK;
+}
+
+/*
+ * 简介：创建可复用的即时通知弹层和暂停状态的定时器。
+ * 输入：parent为有效根屏，不可为空。
+ * 返回值：成功返回RT_EOK，参数无效返回-RT_EINVAL，
+ *         对象已存在返回-RT_EBUSY，分配失败返回-RT_ENOMEM，
+ *         标题字体不可用返回-RT_ERROR。
+ * 说明：仅UI线程调用。全部成功后才提交上下文指针。
+ *       弹层初始隐藏，定时器初始暂停。
+ *       失败时先删除局部定时器，再删除遮罩及其全部子对象。
+ */
+static rt_err_t ui_page_create_notification_overlay(lv_obj_t *parent)
+{
+    lv_obj_t *overlay = RT_NULL;
+    lv_obj_t *card;
+    lv_obj_t *title_label;
+    lv_obj_t *body_label;
+    lv_obj_t *close_button;
+    lv_obj_t *close_label;
+    lv_timer_t *timer = RT_NULL;
+    const lv_font_t *title_font;
+    rt_err_t result = -RT_ENOMEM;
+
+    if (parent == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (g_ui_page_context.notice_overlay != RT_NULL ||
+        g_ui_page_context.notice_overlay_title != RT_NULL ||
+        g_ui_page_context.notice_overlay_body != RT_NULL ||
+        g_ui_page_context.notice_close_button != RT_NULL ||
+        g_ui_page_context.notice_timer != RT_NULL)
+    {
+        return -RT_EBUSY;
+    }
+
+    overlay = lv_obj_create(parent);
+    if (overlay == RT_NULL)
+    {
+        return -RT_ENOMEM;
+    }
+
+    lv_obj_set_size(overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(overlay);
+
+    /* 创建期间即隐藏，同时保留全屏触摸拦截能力。 */
+    lv_obj_add_flag( overlay,
+                    LV_OBJ_FLAG_HIDDEN |
+                    LV_OBJ_FLAG_CLICKABLE |
+                    LV_OBJ_FLAG_PRESS_LOCK);
+
+    lv_obj_clear_flag( overlay,
+                        LV_OBJ_FLAG_SCROLLABLE |
+                        LV_OBJ_FLAG_SCROLL_CHAIN |
+                        LV_OBJ_FLAG_GESTURE_BUBBLE |
+                        LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_set_style_pad_all(overlay, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(overlay, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(  overlay, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, LV_PART_MAIN);
+
+    card = lv_obj_create(overlay);
+    if (card == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_obj_set_size(card, LV_PCT(88), 320);
+    lv_obj_center(card);
+
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag( card,
+                    LV_OBJ_FLAG_SCROLLABLE |
+                    LV_OBJ_FLAG_SCROLL_CHAIN |
+                    LV_OBJ_FLAG_GESTURE_BUBBLE |
+                    LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_set_style_pad_all(card, 16, LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(
+        card, lv_color_hex(0x18202A), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+
+    title_label = lv_label_create(card);
+    if (title_label == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_ext_set_local_font(title_label, FONT_NORMAL, LV_COLOR_WHITE);
+    title_font = lv_obj_get_style_text_font(title_label, LV_PART_MAIN);
+    if (title_font == RT_NULL)
+    {
+        result = -RT_ERROR;
+        goto create_failed;
+    }
+
+    /* 固定为一行高度，过长标题在弹层中裁切。 */
+    lv_obj_set_width(title_label, LV_PCT(100));
+    lv_obj_set_height(title_label, title_font->line_height);
+    lv_label_set_long_mode(title_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_clear_flag( title_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    body_label = lv_label_create(card);
+    if (body_label == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_obj_set_size(body_label, LV_PCT(100), 176);
+    lv_label_set_long_mode(body_label, LV_LABEL_LONG_WRAP);
+    lv_ext_set_local_font( body_label, FONT_NORMAL, lv_color_hex(0xD8DEE8));
+    lv_obj_align(body_label, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_clear_flag(
+        body_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    close_button = lv_btn_create(card);
+    if (close_button == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_obj_set_size(close_button, 96, 44);
+    lv_obj_align(close_button, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_clear_flag( close_button,
+                        LV_OBJ_FLAG_SCROLLABLE |
+                        LV_OBJ_FLAG_GESTURE_BUBBLE |
+                        LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    close_label = lv_label_create(close_button);
+    if (close_label == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_label_set_text(close_label, "关闭");
+    lv_ext_set_local_font(close_label, FONT_NORMAL, LV_COLOR_WHITE);
+    lv_obj_clear_flag( close_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(close_label);
+
+    if (lv_obj_add_event_cb( close_button,
+                            ui_page_notification_close_cb,
+                            LV_EVENT_ALL,
+                            RT_NULL) == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    timer = lv_timer_create( ui_page_notification_timer_cb,
+                            UI_NOTICE_TIMER_PERIOD_MS,
+                            RT_NULL);
+    if (timer == RT_NULL)
+    {
+        goto create_failed;
+    }
+
+    lv_timer_pause(timer);
+
+    /*
+     * 标签持有上下文缓冲地址，后续由present统一更新内容。
+     * 这些缓冲的生命周期覆盖标签。
+     */
+    g_ui_page_context.overlay_title_text[0] = '\0';
+    g_ui_page_context.overlay_body_text[0] = '\0';
+
+    lv_label_set_text_static(title_label, g_ui_page_context.overlay_title_text);
+    lv_label_set_text_static(body_label, g_ui_page_context.overlay_body_text);
+
+    /* 全部对象创建成功后，再发布上下文引用。 */
+    g_ui_page_context.notice_overlay = overlay;
+    g_ui_page_context.notice_overlay_title = title_label;
+    g_ui_page_context.notice_overlay_body = body_label;
+    g_ui_page_context.notice_close_button = close_button;
+    g_ui_page_context.notice_timer = timer;
+
+    g_ui_page_context.notice_visible = RT_FALSE;
+    g_ui_page_context.notice_return_page = UI_PAGE_COUNT;
+    g_ui_page_context.notice_display_id = 0U;
+    g_ui_page_context.notice_pressed_close_id = 0U;
+    g_ui_page_context.notice_deadline = 0;
+
+    g_ui_page_context.notice_close_press_start.x = 0;
+    g_ui_page_context.notice_close_press_start.y = 0;
+    g_ui_page_context.notice_close_dragged = RT_FALSE;
+
+    return RT_EOK;
+
+create_failed:
+    if (timer != RT_NULL)
+    {
+        lv_timer_del(timer);
+    }
+
+    lv_obj_del(overlay);
+    return result;
+}
+
+/*
+ * 简介：识别关闭按钮短点击并投递带显示ID的关闭动作。
+ * 输入：event为LVGL按钮事件，不可为空。
+ * 返回值：无。
+ * 说明：仅UI线程回调。按下时捕获显示ID，
+ *       拖动、失去按压或通知已替换时取消。
+ *       只投递事件，实际关闭由UI消费点执行。
+ */
+static void ui_page_notification_close_cb(lv_event_t *event)
+{
+    lv_event_code_t code;
+    lv_indev_t *indev;
+    lv_point_t point;
+    lv_area_t button_area;
+    uint32_t pressed_id;
+    rt_bool_t clicked;
+    int dx;
+    int dy;
+
+    if (event == RT_NULL)
+    {
+        return;
+    }
+
+    code = lv_event_get_code(event);
+    if (code != LV_EVENT_PRESSED &&
+        code != LV_EVENT_PRESSING &&
+        code != LV_EVENT_PRESS_LOST &&
+        code != LV_EVENT_SHORT_CLICKED)
+    {
+        return;
+    }
+
+    /* 失去按压时，输入设备可能正在被reset，直接撤销捕获。 */
+    if (code == LV_EVENT_PRESS_LOST)
+    {
+        g_ui_page_context.notice_pressed_close_id = 0U;
+        g_ui_page_context.notice_close_dragged = RT_FALSE;
+        return;
+    }
+
+    if (g_ui_page_context.stats.created != RT_TRUE ||
+        g_ui_page_context.notice_visible != RT_TRUE ||
+        g_ui_page_context.notice_close_button == RT_NULL ||
+        lv_event_get_current_target(event) != g_ui_page_context.notice_close_button)
+    {
+        return;
+    }
+
+    indev = lv_indev_get_act();
+    if (indev == RT_NULL ||  lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER)
+    {
+        g_ui_page_context.notice_pressed_close_id = 0U;
+        g_ui_page_context.notice_close_dragged = RT_FALSE;
+        return;
+    }
+
+    lv_indev_get_point(indev, &point);
+
+    if (code == LV_EVENT_PRESSED)
+    {
+        g_ui_page_context.notice_pressed_close_id = g_ui_page_context.notice_display_id;
+
+        g_ui_page_context.notice_close_press_start = point;
+        g_ui_page_context.notice_close_dragged = RT_FALSE;
+        return;
+    }
+
+    if (g_ui_page_context.notice_pressed_close_id == 0U)
+    {
+        return;
+    }
+
+    dx = (int)point.x - (int)g_ui_page_context.notice_close_press_start.x;
+    dy = (int)point.y - (int)g_ui_page_context.notice_close_press_start.y;
+
+    if (dx > UI_NOTICE_TAP_SLOP_PX ||
+        dx < -UI_NOTICE_TAP_SLOP_PX ||
+        dy > UI_NOTICE_TAP_SLOP_PX ||
+        dy < -UI_NOTICE_TAP_SLOP_PX ||
+        lv_indev_get_scroll_obj(indev) != RT_NULL)
+    {
+        g_ui_page_context.notice_close_dragged = RT_TRUE;
+    }
+
+    if (code != LV_EVENT_SHORT_CLICKED)
+    {
+        return;
+    }
+
+    pressed_id = g_ui_page_context.notice_pressed_close_id;
+
+    lv_obj_get_coords( g_ui_page_context.notice_close_button, &button_area);
+
+    clicked = g_ui_page_context.notice_close_dragged == RT_FALSE &&
+        pressed_id == g_ui_page_context.notice_display_id &&
+        point.x >= button_area.x1 &&
+        point.x <= button_area.x2 &&
+        point.y >= button_area.y1 &&
+        point.y <= button_area.y2;
+
+    /* 先结束本次按压，再尝试投递。队列满时也可重新点击。 */
+    g_ui_page_context.notice_pressed_close_id = 0U;
+    g_ui_page_context.notice_close_dragged = RT_FALSE;
+
+    if (clicked == RT_TRUE)
+    {
+        ui_page_post_touch_action(UI_ACTION_NOTICE_CLOSE, pressed_id);
+    }
+}
+
+/*
+ * 简介：检查当前通知是否到期并关闭弹层。
+ * 输入：timer为LVGL传入的通知定时器。
+ * 返回值：无。
+ * 说明：仅UI线程执行。只处理当前上下文持有的定时器，
+ *       使用单调tick和回绕安全比较，不读取日历时间。
+ */
+static void ui_page_notification_timer_cb(lv_timer_t *timer)
+{
+    uint32_t display_id;
+    rt_tick_t now;
+    rt_err_t result;
+
+    if (timer == RT_NULL ||
+        timer != g_ui_page_context.notice_timer ||
+        g_ui_page_context.stats.created != RT_TRUE ||
+        g_ui_page_context.notice_visible != RT_TRUE)
+    {
+        return;
+    }
+
+    display_id = g_ui_page_context.notice_display_id;
+    if (display_id == 0U)
+    {
+        return;
+    }
+
+    now = rt_tick_get();
+    if (ui_page_tick_reached( now, g_ui_page_context.notice_deadline) != RT_TRUE)
+    {
+        return;
+    }
+
+    result = ui_page_notification_close( display_id, UI_NOTICE_CLOSE_TIMEOUT);
+
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[UI][NOTICE][TIMEOUT_FAIL] id=%lu error=%d\n",
+                   (unsigned long)display_id,
+                   (int)result);
+    }
+}
+
+/*
+ * 简介：显示、替换或合并一条有效通知。
+ * 输入：message为take取得的有效消息副本；
+ *       outcome为非空输出，接收显示、替换或合并结果。
+ * 返回值：成功返回RT_EOK，参数无效返回-RT_EINVAL，
+ *         UI或诊断状态不允许时返回相应错误。
+ * 说明：仅UI线程调用。失败时outcome保持REJECTED。
+ *       重复内容合并且不续时，新内容成功准备后才修改弹层。
+ */
+rt_err_t ui_page_notification_present( const ui_notice_message_t *message, ui_notice_outcome_t *outcome)
+{
+    ui_touch_diag_stats_t touch_stats;
+    const lv_font_t *title_font;
+    const lv_font_t *body_font;
+    const char *title_source;
+    size_t title_length;
+
+    char title_candidate[UI_NOTICE_TITLE_MAX_BYTES + 1U];
+    char body_candidate[UI_NOTICE_BODY_MAX_BYTES + 1U];
+
+    rt_bool_t replacing;
+    rt_bool_t same_content;
+    rt_tick_t timeout_ticks;
+    rt_err_t result;
+
+    if (outcome == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+    *outcome = UI_NOTICE_REJECTED;
+
+    if (message == RT_NULL || message->request_id == 0U ||
+        message->title_length > UI_NOTICE_TITLE_MAX_BYTES ||
+        message->body_length > UI_NOTICE_BODY_MAX_BYTES)
+    {
+        return -RT_EINVAL;
+    }
+
+    /* 长度检查通过后，才可安全访问对应终止符位置。 */
+    if (message->title[message->title_length] != '\0' ||
+        message->body[message->body_length] != '\0')
+    {
+        return -RT_EINVAL;
+    }
+
+    if (g_ui_page_context.stats.created != RT_TRUE)
+    {
+        return -RT_EBUSY;
+    }
+
+    if (g_ui_page_context.notice_overlay == RT_NULL ||
+        g_ui_page_context.notice_overlay_title == RT_NULL ||
+        g_ui_page_context.notice_overlay_body == RT_NULL ||
+        g_ui_page_context.notice_close_button == RT_NULL ||
+        g_ui_page_context.notice_timer == RT_NULL ||
+        ui_page_id_is_valid( g_ui_page_context.stats.current_page) != RT_TRUE)
+    {
+        return -RT_ERROR;
+    }
+
+    /* 在页面入口再次确认，诊断可见时保持其输入所有权。 */
+    result = ui_touch_diag_get_stats(&touch_stats);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    if (touch_stats.enabled == RT_TRUE)
+    {
+        return -RT_EBUSY;
+    }
+
+    replacing = g_ui_page_context.notice_visible;
+
+    /*
+     * 弹层期间底页应保持不变。
+     * 发现导航门禁被绕过时，保留现场并返回错误。
+     */
+    if (replacing == RT_TRUE && g_ui_page_context.notice_return_page != g_ui_page_context.stats.current_page)
+    {
+        return -RT_ERROR;
+    }
+
+    same_content = RT_FALSE;
+    // 检查当前通知内容是否与最近记录的内容相同
+    if (g_ui_page_context.has_latest_notice == RT_TRUE)
+    {
+        same_content = message->title_length == g_ui_page_context.latest_notice.title_length &&
+                       message->body_length == g_ui_page_context.latest_notice.body_length &&
+            memcmp(message->title,g_ui_page_context.latest_notice.title, message->title_length) == 0 &&
+            memcmp(message->body, g_ui_page_context.latest_notice.body, message->body_length) == 0;
+    }
+
+    if (replacing == RT_TRUE && same_content == RT_TRUE)
+    {
+        /*
+         * 只更新最近记录的请求身份。
+         * 当前显示ID和截止时间保持原值，旧按钮捕获仍对应当前显示。
+         */
+        g_ui_page_context.latest_notice.request_id = message->request_id;
+
+        ui_page_stat_increment( &g_ui_page_context.stats.notice_merged_count);
+
+        *outcome = UI_NOTICE_MERGED;
+        return RT_EOK;
+    }
+
+    title_source = message->title;
+    title_length = message->title_length;
+    if (title_length == 0U)
+    {
+        title_source = "通知";
+        title_length = sizeof("通知") - 1U;
+    }
+
+    title_font = lv_obj_get_style_text_font( g_ui_page_context.notice_overlay_title, LV_PART_MAIN);
+    body_font = lv_obj_get_style_text_font( g_ui_page_context.notice_overlay_body, LV_PART_MAIN);
+
+    /*
+     * 两段文本均先写局部候选。
+     * 正文失败时，当前弹层标题和正文都保持原内容。
+     */
+    result = ui_page_prepare_notice_text( title_source, title_length, title_font, title_candidate, sizeof(title_candidate));
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    result = ui_page_prepare_notice_text( message->body, message->body_length, body_font, body_candidate, sizeof(body_candidate));
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    timeout_ticks = ui_page_ms_to_ticks(UI_NOTICE_TIMEOUT_MS);
+    if (timeout_ticks == 0 || (rt_uint64_t)timeout_ticks > 0x7FFFFFFFULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    ui_page_cancel_product_touch();
+
+    /* 首次显示才记底页，替换通知继续使用同一个返回页。 */
+    if (replacing != RT_TRUE)
+    {
+        g_ui_page_context.notice_return_page = g_ui_page_context.stats.current_page;
+    }
+
+    /* 原始记录供回看，显示缓冲只保存字形回退后的文本。 */
+    g_ui_page_context.latest_notice = *message;
+    g_ui_page_context.has_latest_notice = RT_TRUE;
+
+    if (same_content != RT_TRUE)
+    {
+        g_ui_page_context.recent_notice_dirty = RT_TRUE;
+    }
+
+    memcpy(g_ui_page_context.overlay_title_text, title_candidate, strlen(title_candidate) + 1U);
+    memcpy(g_ui_page_context.overlay_body_text, body_candidate, strlen(body_candidate) + 1U);
+
+    lv_label_set_text_static( g_ui_page_context.notice_overlay_title, g_ui_page_context.overlay_title_text);
+    lv_label_set_text_static( g_ui_page_context.notice_overlay_body, g_ui_page_context.overlay_body_text);
+
+    /*
+     * 完成文本准备后才开始计时。
+     * 使用请求ID作为本次显示身份，迟到关闭无法匹配新通知。
+     */
+    g_ui_page_context.notice_display_id = message->request_id;
+    g_ui_page_context.notice_deadline = rt_tick_get() + timeout_ticks;
+    g_ui_page_context.notice_visible = RT_TRUE;
+
+    lv_obj_move_foreground(g_ui_page_context.notice_overlay);
+    lv_obj_clear_flag( g_ui_page_context.notice_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    lv_timer_reset(g_ui_page_context.notice_timer);
+    lv_timer_resume(g_ui_page_context.notice_timer);
+
+    if (replacing == RT_TRUE)
+    {
+        ui_page_stat_increment( &g_ui_page_context.stats.notice_replaced_count);
+        *outcome = UI_NOTICE_REPLACED;
+    }
+    else
+    {
+        ui_page_stat_increment( &g_ui_page_context.stats.notice_shown_count);
+        *outcome = UI_NOTICE_SHOWN;
+    }
+
+    return RT_EOK;
+}
+
+
+/*
+ * 简介：关闭指定显示身份的通知弹层。
+ * 输入：expected_id为非零显示ID；
+ *       reason为手动、超时或进入触摸诊断。
+ * 返回值：关闭或合法无操作返回RT_EOK，
+ *         参数、对象或页面状态异常返回相应错误。
+ * 说明：仅UI线程调用。迟到ID不会影响新弹层。
+ *       关闭后保留最近记录，进入诊断时跳过底页刷新。
+ */
+rt_err_t ui_page_notification_close(uint32_t expected_id, ui_notice_close_reason_t reason)
+{
+    ui_page_id_t return_page;
+    rt_err_t result;
+    rt_err_t clock_result = RT_EOK;
+    rt_err_t refresh_result = RT_EOK;
+
+    if (expected_id == 0U ||
+        (reason != UI_NOTICE_CLOSE_MANUAL &&
+         reason != UI_NOTICE_CLOSE_TIMEOUT &&
+         reason != UI_NOTICE_CLOSE_DIAG))
+    {
+        return -RT_EINVAL;
+    }
+
+    if (g_ui_page_context.stats.created != RT_TRUE)
+    {
+        return -RT_EBUSY;
+    }
+
+    /*
+     * 已关闭或ID已过期均属于合法无操作。
+     * 此分支不能暂停定时器或清理新弹层状态。
+     */
+    if (g_ui_page_context.notice_visible != RT_TRUE || expected_id != g_ui_page_context.notice_display_id)
+    {
+        ui_page_stat_increment( &g_ui_page_context.stats.notice_stale_close_count);
+        return RT_EOK;
+    }
+
+    if (g_ui_page_context.notice_overlay == RT_NULL ||
+        g_ui_page_context.notice_timer == RT_NULL ||
+        ui_page_id_is_valid( g_ui_page_context.notice_return_page) != RT_TRUE)
+    {
+        return -RT_ERROR;
+    }
+
+    return_page = g_ui_page_context.notice_return_page;
+
+    /* 先停止到期检查，再隐藏对象并撤销本次显示身份。 */
+    lv_timer_pause(g_ui_page_context.notice_timer);
+    ui_page_cancel_product_touch();
+
+    lv_obj_add_flag( g_ui_page_context.notice_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    g_ui_page_context.notice_visible = RT_FALSE;
+    g_ui_page_context.notice_display_id = 0U;
+    g_ui_page_context.notice_deadline = 0;
+    g_ui_page_context.notice_return_page = UI_PAGE_COUNT;
+
+    switch (reason)
+    {
+    case UI_NOTICE_CLOSE_MANUAL:
+        ui_page_stat_increment( &g_ui_page_context.stats.notice_manual_close_count);
+        break;
+
+    case UI_NOTICE_CLOSE_TIMEOUT:
+        ui_page_stat_increment( &g_ui_page_context.stats.notice_timeout_close_count);
+        break;
+
+    case UI_NOTICE_CLOSE_DIAG:
+        ui_page_stat_increment( &g_ui_page_context.stats.notice_diag_close_count);
+        break;
+
+    default:
+        break;
+    }
+
+    /*
+     * 诊断层已接管显示和输入。
+     * 此时只完成弹层关闭，诊断退出由原有HOME路径处理。
+     */
+    if (reason == UI_NOTICE_CLOSE_DIAG)
+    {
+        return RT_EOK;
+    }
+
+    /*
+     * 正常门禁下current_page始终等于return_page。
+     * 若发生意外变化，尝试恢复到保存的页面。
+     */
+    if (g_ui_page_context.stats.current_page != return_page)
+    {
+        result = ui_page_show(return_page);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+    }
+
+    /*
+     * 同页show会提前返回，因此这里显式补刷。
+     * notice_visible已清除，刷新函数可以正常读取业务副本。
+     */
+    switch (return_page)
+    {
+    case UI_PAGE_WATCHFACE:
+        g_ui_page_context.watchface_clock_cached = RT_FALSE;
+        clock_result = ui_page_refresh_clock();
+        refresh_result = ui_page_refresh_motion();
+        break;
+
+    case UI_PAGE_MOTION:
+        refresh_result = ui_page_refresh_motion();
+        break;
+
+    case UI_PAGE_SENSOR_DIAG:
+        refresh_result = ui_page_refresh_sensor_diag();
+        break;
+
+    case UI_PAGE_RECENT_NOTIFICATIONS:
+        refresh_result = ui_page_refresh_recent_notification();
+        break;
+
+    default:
+        /* 菜单、设置和系统信息目前没有周期业务刷新。 */
+        break;
+    }
+
+    /*
+     * 弹层已经关闭成功。
+     * 快照暂不可用作为底页刷新问题记录，不重复关闭弹层。
+     */
+    if (clock_result != RT_EOK || refresh_result != RT_EOK)
+    {
+        rt_kprintf("[UI][NOTICE][RESTORE_REFRESH] "
+                   "page=%d clock=%d content=%d\n",
+                   (int)return_page,
+                   (int)clock_result,
+                   (int)refresh_result);
+    }
+
+    return RT_EOK;
+}
+/*
+ * 简介：触摸诊断启用后，结束产品弹层及残留触摸。
+ * 输入：无。
+ * 返回值：RT_EOK，或页面未就绪、弹层关闭错误。
+ * 说明：仅UI线程调用，且只用于诊断从关闭到启用的转换。
+ *       最近通知记录保留，诊断退出时由既有HOME路径返回表盘。
+ */
+rt_err_t ui_page_on_touch_diag_enabled(void)
+{
+    if (g_ui_page_context.stats.created != RT_TRUE)
+    {
+        return -RT_EBUSY;
+    }
+
+    if (g_ui_page_context.notice_visible == RT_TRUE)
+    {
+        /* close内部已经包含触摸取消。 */
+        return ui_page_notification_close(
+            g_ui_page_context.notice_display_id,
+            UI_NOTICE_CLOSE_DIAG);
+    }
+
+    /* 无弹层时，也要结束菜单或底页尚未完成的按压。 */
+    ui_page_cancel_product_touch();
+
+    return RT_EOK;
+}
+
+/*
+ * 简介：复制通知显示状态，供串口诊断查询。
+ * 输入：view为非空输出指针。
+ * 返回值：RT_EOK或-RT_EINVAL。
+ * 说明：单核短临界区内复制值，不返回LVGL对象。
+ *       测试应在请求终态落定、事件队列排空后判定检查点。
+ */
+rt_err_t ui_page_get_notice_view(ui_notice_view_t *view)
+{
+    rt_base_t level;
+    ui_notice_view_t value;
+
+    if (view == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    value.visible = g_ui_page_context.notice_visible;
+    value.has_latest = g_ui_page_context.has_latest_notice;
+    value.display_id = g_ui_page_context.notice_display_id;
+    value.latest_id = value.has_latest
+                    ? g_ui_page_context.latest_notice.request_id : 0U;
+    value.return_page = g_ui_page_context.notice_return_page;
+    value.deadline_tick = g_ui_page_context.notice_deadline;
+    value.sample_tick = rt_tick_get();
+
+    rt_hw_interrupt_enable(level);
+
+    *view = value;
+    return RT_EOK;
+}
+//---------------------------------------------------------------公开函数---------------------------------------------------------------
+
+/*
+ * 简介：取消产品页面尚未结束的触摸序列。
+ * 输入：无。
+ * 返回值：无。
+ * 说明：仅UI线程调用。切入、替换或关闭弹层时，
+ *       清理对象捕获并等待手指释放，防止跨层点击。
+ *       这个辅助函数由 UI 线程在切层时调用。
+ *       它遍历已注册的 pointer 设备，避免依赖仅在输入回调期间有效的 lv_indev_get_act()。
+ */
+static void ui_page_cancel_product_touch(void)
+{
+    lv_indev_t *indev;
+
+    g_ui_page_context.menu_pressed_row = RT_NULL;
+    g_ui_page_context.menu_press_start.x = 0;
+    g_ui_page_context.menu_press_start.y = 0;
+    g_ui_page_context.menu_press_dragged = RT_FALSE;
+
+    g_ui_page_context.notice_pressed_close_id = 0U;
+    g_ui_page_context.notice_close_press_start.x = 0;
+    g_ui_page_context.notice_close_press_start.y = 0;
+    g_ui_page_context.notice_close_dragged = RT_FALSE;
+
+    indev = lv_indev_get_next(RT_NULL);
+    while (indev != RT_NULL)
+    {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER)
+        {
+            /*
+             * reset撤销旧对象和滚动捕获。
+             * wait_release阻止同一次按压立即作用到新显示层。
+             */
+            lv_indev_reset(indev, RT_NULL);
+            lv_indev_wait_release(indev);
+        }
+
+        indev = lv_indev_get_next(indev);
+    }
 }

@@ -539,9 +539,9 @@ static void app_handle_event(const app_event_t *event)
                 * 当前只记录，不控制RGB。
                 * app线程只发布UI语义事件，不直接操作LVGL对象
                 */
-                rt_kprintf("[APP][KEY1] HOME short press\n");
+                rt_kprintf("[APP][KEY1] OPEN_MENU short press\n");
                 //进行ui动作
-                ui_result=app_request_ui_action(UI_ACTION_HOME,UI_EVENT_SOURCE_KEY,0u);
+                ui_result=app_request_ui_action(UI_ACTION_OPEN_MENU,UI_EVENT_SOURCE_KEY,0u);
                 if(ui_result!=RT_EOK)
                 {
                     rt_kprintf("[APP][KEY1][WARN] ui action failed:%d\n",(int)ui_result);
@@ -574,17 +574,6 @@ static void app_handle_event(const app_event_t *event)
                 {
                     rt_kprintf("[APP][INDICATOR][WARN] device unavailable\n");
                 }
-                /*
-                 * RGB业务成功、失败或不可用，都不阻止UI请求。
-                 * 两条业务链相互独立。
-                 */
-                //进行ui动作
-                ui_result=app_request_ui_action(UI_ACTION_NEXT,UI_EVENT_SOURCE_KEY,0U);
-                if(ui_result!=RT_EOK)
-                {
-                    rt_kprintf("[APP][KEY2][WARN] ui action failed:%d\n",ui_result);
-                }
-
 
                 break;
             }

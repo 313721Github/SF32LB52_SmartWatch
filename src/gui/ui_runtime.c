@@ -5,6 +5,7 @@
 #include "lvgl.h"
 #include "lv_ex_data.h"
 #include "ui_touch_diag.h"
+#include "ui_notification.h"
 #include <string.h>
 
 #ifdef RT_USING_FINSH
@@ -95,12 +96,12 @@ static void ui_runtime_update_event_stats(
     rt_tick_t complete_latency_ticks,
     rt_bool_t event_valid,
     rt_err_t handle_result);                                                                        //更新事件统计
-static rt_err_t ui_runtime_page_action_handler(ui_action_t action,rt_tick_t request_tick,void *user_data);//页面动作回调函数
+static rt_err_t ui_runtime_page_action_handler(ui_action_t action,rt_tick_t request_tick,rt_uint32_t value,void *user_data);//页面动作回调函数
 static void ui_runtime_stat_increment(rt_uint32_t *counter);                                        //线程安全地增加一个32位统计计数
 static rt_bool_t ui_event_is_valid(const ui_event_t *event);                                        //ui事件合法性判断
 static void ui_runtime_release_event_queue(void);                                                   //队列清理函数
 static void ui_runtime_record_post_success(const ui_event_t *event);                                //记录一次成功投递的UI事件，并更新最大未完成事件数
-
+static rt_err_t ui_runtime_handle_notice_ready(rt_uint32_t request_id);                             //领取并处理一条已就绪的通知请求
 #ifdef RT_USING_FINSH
 static int ui_event_stress(void);                                                                   //ui事件压力测试
 #endif
@@ -673,9 +674,37 @@ static rt_err_t ui_runtime_handle_event(const ui_event_t *event)
         switch (event->type)
         {
         case UI_ACTION_TOUCH_DIAG_ENABLE:
-            handle_result = ui_touch_diag_set_enabled(RT_TRUE);
-            break;
+            {
+                ui_touch_diag_stats_t before;
 
+                /* UI线程串行处理，先判断是否发生真正的启用转换。 */
+                handle_result = ui_touch_diag_get_stats(&before);
+                if (handle_result != RT_EOK)
+                {
+                    break;
+                }
+
+                if (before.enabled == RT_TRUE)
+                {
+                    /* 重复on保持幂等，不打断正在进行的诊断触摸。 */
+                    break;
+                }
+
+                handle_result = ui_touch_diag_set_enabled(RT_TRUE);
+                if (handle_result == RT_EOK)
+                {
+                    handle_result = ui_page_on_touch_diag_enabled();
+
+                    if (handle_result != RT_EOK)
+                    {
+                        rt_kprintf(
+                            "[UI][TOUCH][PRODUCT_CLEANUP_FAIL] error=%d\n",
+                            (int)handle_result);
+                    }
+                }
+
+                break;
+            }
         case UI_ACTION_TOUCH_DIAG_DISABLE:
             handle_result = ui_touch_diag_set_enabled(RT_FALSE);
 
@@ -691,6 +720,31 @@ static rt_err_t ui_runtime_handle_event(const ui_event_t *event)
             }
             break;
 
+        case UI_ACTION_HOME:
+        case UI_ACTION_BACK:
+        case UI_ACTION_OPEN_MENU:
+        case UI_ACTION_SWIPE_LEFT:
+        case UI_ACTION_SWIPE_RIGHT:
+        case UI_ACTION_OPEN_DETAIL:
+            {
+                ui_touch_diag_stats_t touch_stats;
+
+                handle_result = ui_touch_diag_get_stats(&touch_stats);
+                if (handle_result == RT_EOK && touch_stats.enabled != RT_TRUE)
+                {
+                    handle_result = ui_page_handle_event(event);
+                }
+                break;
+            }
+        case UI_ACTION_NOTICE_READY:
+            {
+                handle_result = ui_runtime_handle_notice_ready(event->value);
+
+                break;
+            }
+        case UI_ACTION_NOTICE_CLOSE:
+            handle_result = ui_page_notification_close(event->value, UI_NOTICE_CLOSE_MANUAL);
+            break;
         default:
             handle_result = ui_page_handle_event(event);
             break;
@@ -854,10 +908,7 @@ static void ui_runtime_update_event_stats(
  *        user_data：用户数据
  * 返回值：无
  */
-static rt_err_t ui_runtime_page_action_handler(
-    ui_action_t action,
-    rt_tick_t request_tick,
-    void *user_data)
+static rt_err_t ui_runtime_page_action_handler(ui_action_t action,rt_tick_t request_tick, rt_uint32_t value, void *user_data)
 {
     ui_event_t event;
 
@@ -872,7 +923,7 @@ static rt_err_t ui_runtime_page_action_handler(
     event.type = action;
     event.source = UI_EVENT_SOURCE_TOUCH;
     event.tick = request_tick;
-    event.value = 0U;
+    event.value = value;
 
     /*
      * 即使当前调用者就是UI线程，也只进行非阻塞投递。
@@ -1222,48 +1273,43 @@ static void ui_runtime_thread_fail(
 static rt_bool_t ui_event_is_valid(const ui_event_t *event)
 {
 
-    if (event == RT_NULL)
+    if (event == RT_NULL ||
+        event->source < UI_EVENT_SOURCE_APP ||
+        event->source >= UI_EVENT_SOURCE_COUNT)
     {
         return RT_FALSE;
     }
 
-    if (event->type <= UI_ACTION_NONE)
+    switch (event->type)
     {
+    case UI_ACTION_HOME:
+    case UI_ACTION_BACK:
+    case UI_ACTION_OPEN_MENU:
+    case UI_ACTION_TOUCH_DIAG_ENABLE:
+    case UI_ACTION_TOUCH_DIAG_DISABLE:
+        return event->value == 0U;
+
+    case UI_ACTION_SWIPE_LEFT:
+    case UI_ACTION_SWIPE_RIGHT:
+        return event->value == (rt_uint32_t)UI_PAGE_WATCHFACE ||
+               event->value == (rt_uint32_t)UI_PAGE_MOTION ||
+               event->value == (rt_uint32_t)UI_PAGE_RECENT_NOTIFICATIONS;
+
+    case UI_ACTION_OPEN_DETAIL:
+        return event->value == (rt_uint32_t)UI_PAGE_SENSOR_DIAG ||
+               event->value == (rt_uint32_t)UI_PAGE_SETTINGS ||
+               event->value == (rt_uint32_t)UI_PAGE_SYSTEM_INFO;
+
+    case UI_ACTION_REFRESH_STATUS:
+        return RT_TRUE;
+
+    case UI_ACTION_NOTICE_READY:
+    case UI_ACTION_NOTICE_CLOSE:
+        return event->value != 0U;
+
+    default:
         return RT_FALSE;
     }
-
-    if (event->type >= UI_ACTION_COUNT)
-    {
-        return RT_FALSE;
-    }
-
-    if ((event->source < UI_EVENT_SOURCE_APP)||(event->source >= UI_EVENT_SOURCE_COUNT))
-    {
-        return RT_FALSE;
-    }
-    if (event->type == UI_ACTION_HOME ||
-        event->type == UI_ACTION_NEXT ||
-        event->type == UI_ACTION_BACK)
-    {
-        if (event->value != 0)
-        {
-            return RT_FALSE;
-        }
-    }
-
-    if (event->type == UI_ACTION_HOME ||
-    event->type == UI_ACTION_NEXT ||
-    event->type == UI_ACTION_BACK ||
-    event->type == UI_ACTION_TOUCH_DIAG_ENABLE ||
-    event->type == UI_ACTION_TOUCH_DIAG_DISABLE)
-    {
-        if (event->value != 0)
-        {
-            return RT_FALSE;
-        }
-    }
-
-    return RT_TRUE;
 
 }
 
@@ -2076,6 +2122,79 @@ static int ui_touch_diag(int argc, char **argv)
     return result;
 }
 
+
+/*
+ * 简介：领取并处理一条已就绪的通知请求。
+ * 输入：request_id为UI事件携带的非零请求ID。
+ * 返回值：成功返回RT_EOK，否则返回领取、显示或完成处理的错误。
+ * 说明：仅UI线程调用。
+ *       领取失败时保留等待槽；领取成功后，无论显示还是拒绝，
+ *       都提交一次终态结果。完成处理失败时优先返回该错误。
+ */
+static rt_err_t ui_runtime_handle_notice_ready(rt_uint32_t request_id)
+{
+    ui_notice_message_t message;
+    ui_touch_diag_stats_t touch_stats;
+    ui_notice_outcome_t outcome = UI_NOTICE_REJECTED;
+    rt_err_t result;
+    rt_err_t display_result;
+    rt_err_t complete_result;
+
+    result = ui_notification_take(request_id, &message);
+    if (result != RT_EOK)
+    {
+        /* 未取得消费所有权，不能释放等待槽。 */
+        return result;
+    }
+
+    display_result = ui_touch_diag_get_stats(&touch_stats);
+    if (display_result == RT_EOK)
+    {
+        if (touch_stats.enabled == RT_TRUE)
+        {
+            display_result = -RT_EBUSY;
+        }
+        else
+        {
+            display_result =
+                ui_page_notification_present(&message, &outcome);
+        }
+    }
+
+    if (display_result != RT_EOK)
+    {
+        outcome = UI_NOTICE_REJECTED;
+    }
+    else if (outcome != UI_NOTICE_SHOWN &&
+             outcome != UI_NOTICE_REPLACED &&
+             outcome != UI_NOTICE_MERGED)
+    {
+        /* 成功返回必须对应一个有效的显示处理终态。 */
+        display_result = -RT_ERROR;
+        outcome = UI_NOTICE_REJECTED;
+    }
+
+    /*
+     * 已取得消费所有权，所有处理分支均在此提交终态。
+     * complete负责保存结果并释放等待槽。
+     */
+    complete_result =
+        ui_notification_complete(request_id, outcome, display_result);
+
+    if (complete_result != RT_EOK)
+    {
+        rt_kprintf(
+            "[UI][NOTICE][COMPLETE_FAIL] "
+            "id=%lu display=%d complete=%d\n",
+            (unsigned long)request_id,
+            (int)display_result,
+            (int)complete_result);
+
+        return complete_result;
+    }
+
+    return display_result;
+}
 
 #ifdef RT_USING_FINSH
 
